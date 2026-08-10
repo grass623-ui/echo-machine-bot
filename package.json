@@ -1,0 +1,13 @@
+{
+  "name": "echo-machine-bot",
+  "version": "1.0.0",
+  "description": "Discord reservation bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.15.0",
+    "express": "^4.19.2"
+  }
+}
