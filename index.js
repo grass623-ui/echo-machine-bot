@@ -2,14 +2,13 @@ require('dotenv').config();
 const express = require('express');
 const admin = require('firebase-admin');
 const { 
-    Client, GatewayIntentBits, 
-    ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder, EmbedBuilder 
+    Client, GatewayIntentBits, Partials,
+    ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder, EmbedBuilder, PermissionsBitField 
 } = require('discord.js');
 
 // ==========================================
 // 1. 初始化 Firebase 資料庫
 // ==========================================
-// 從 Render 的環境變數讀取金鑰並解析
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 admin.initializeApp({
     credential: admin.credential.cert(serviceAccount)
@@ -18,74 +17,154 @@ const db = admin.firestore();
 console.log('✅ Firebase 資料庫連線成功！');
 
 // ==========================================
-// 2. Web 伺服器 (維持 UptimeRobot 喚醒用)
+// 2. Web 伺服器 (防止休眠)
 // ==========================================
 const app = express();
 const port = process.env.PORT || 3000;
-app.get('/', (req, res) => res.send('Bot is currently alive and running!'));
+app.get('/', (req, res) => res.send('Bot is running!'));
 app.listen(port, () => console.log(`[Web Server] Listening on port ${port}`));
 
 // ==========================================
-// 3. Discord 機器人核心邏輯
+// 3. Discord 機器人核心
 // ==========================================
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({ 
+    intents: [GatewayIntentBits.Guilds],
+    partials: [Partials.Channel]
+});
+
+// --- 組合班表的功能 (支援隱私遮罩與過濾過期) ---
+function generateScheduleEmbed(reservations, isAdmin = false) {
+    const now = Date.now();
+    // 過濾出「未來」的預約，並依照時間排序
+    const futureRes = reservations
+        .filter(res => res.timestamp > now - (30 * 60 * 1000)) // 保留過去 30 分鐘內的，避免剛開打就消失
+        .sort((a, b) => a.timestamp - b.timestamp);
+
+    if (futureRes.length === 0) {
+        return new EmbedBuilder().setColor(0x0099FF).setTitle('📅 王團排班表').setDescription('目前還沒有未來的預約喔！');
+    }
+
+    // 依照「日期」進行分組
+    const grouped = {};
+    futureRes.forEach(res => {
+        if (!grouped[res.date]) grouped[res.date] = [];
+        grouped[res.date].push(res);
+    });
+
+    let scheduleText = '';
+    for (const [date, items] of Object.entries(grouped)) {
+        scheduleText += `\n**📅 ${date}**\n`;
+        items.forEach((res) => {
+            // 隱私判斷：如果是管理員後台查詢，顯示真實 ID；否則顯示匿名
+            const playerInfo = isAdmin ? `遊戲ID：${res.gameId} | 聯絡：<@${res.discordId}>` : `👤 🔒 匿名玩家`;
+            scheduleText += `> \`${res.time}\` | ${res.location} | 頻道：${res.channel} | ${playerInfo}\n`;
+        });
+    }
+
+    return new EmbedBuilder()
+        .setColor(isAdmin ? 0xFF0000 : 0x0099FF)
+        .setTitle(isAdmin ? '🕵️‍♂️ 【管理員限定】王團真實名單' : '📅 王團自動排班表')
+        .setDescription(scheduleText)
+        .setTimestamp();
+}
 
 client.once('ready', async () => {
     console.log(`[Bot] Logged in as ${client.user.tag}!`);
-    const commands = [{ name: '預約', description: '開啟王團預約表單' }];
+    
+    // 註冊兩個指令：一般預約 & 後台查詢
+    const commands = [
+        { name: '預約', description: '開啟王團預約表單' },
+        { name: '後台查詢', description: '顯示未遮罩的完整真實預約名單 (僅限管理員)' }
+    ];
     await client.application.commands.set(commands);
+
+    // ==========================================
+    // 4. 迴響鬧鐘：每分鐘巡邏一次
+    // ==========================================
+    setInterval(async () => {
+        const now = Date.now();
+        // 找出還沒提醒過的預約
+        const snapshot = await db.collection('reservations').where('reminded', '==', false).get();
+        
+        snapshot.forEach(async doc => {
+            const data = doc.data();
+            const timeDiff = data.timestamp - now;
+            
+            // 如果距離開打小於等於 15 分鐘 (900,000 毫秒)，且還沒過期
+            if (timeDiff <= 15 * 60 * 1000 && timeDiff > 0) {
+                try {
+                    // 發送私訊給預約的玩家
+                    const user = await client.users.fetch(data.discordId);
+                    await user.send(`🔔 **王團提醒鬧鐘**\n您預約的【${data.location}】將在 15 分鐘後（\`${data.date} ${data.time}\`）開始！\n請記得準備施放 **英雄的迴響** 喔！`);
+                    
+                    // 在資料庫中標記為「已提醒」，避免重複發送
+                    await db.collection('reservations').doc(doc.id).update({ reminded: true });
+                } catch (error) {
+                    console.log(`無法私訊玩家 ${data.discordId}，可能是他關閉了陌生私訊。`);
+                }
+            }
+        });
+    }, 60 * 1000); // 每 60 秒執行一次
 });
 
 client.on('interactionCreate', async interaction => {
     
-    // --- 狀況 A：彈出對話框 ---
-    if (interaction.isChatInputCommand() && interaction.commandName === '預約') {
+    // --- 指令：後台查詢 (僅限管理員) ---
+    if (interaction.isChatInputCommand() && interaction.commandName === '後台查詢') {
+        // 檢查權限：是否為管理員
+        if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+            return interaction.reply({ content: '❌ 您沒有權限使用此指令喔！', ephemeral: true });
+        }
+
+        await interaction.deferReply({ ephemeral: true }); // ephemeral: true 代表只有自己看得到
+        const snapshot = await db.collection('reservations').get();
+        let reservations = [];
+        snapshot.forEach(doc => reservations.push({ id: doc.id, ...doc.data() }));
+
+        const embed = generateScheduleEmbed(reservations, true); // true 代表開啟真實名單
+        await interaction.editReply({ embeds: [embed] });
+    }
+
+    // --- 指令：預約表單 ---
+    else if (interaction.isChatInputCommand() && interaction.commandName === '預約') {
         const modal = new ModalBuilder().setCustomId('reservationModal').setTitle('📝 王團預約表單');
-
-        const dateInput = new TextInputBuilder().setCustomId('date').setLabel("日期 (例如：08/11 或 2026-08-11)").setStyle(TextInputStyle.Short).setRequired(true);
-        const timeInput = new TextInputBuilder().setCustomId('time').setLabel("時間 (24小時制，例如：20:30)").setStyle(TextInputStyle.Short).setMaxLength(5).setRequired(true);
-        const locationInput = new TextInputBuilder().setCustomId('location').setLabel("地點 (例如：玩具城深處)").setStyle(TextInputStyle.Short).setRequired(true);
-        const channelInput = new TextInputBuilder().setCustomId('channel').setLabel("頻道 (不確定可填：當日決定)").setStyle(TextInputStyle.Short).setRequired(true);
-        const gameIdInput = new TextInputBuilder().setCustomId('gameId').setLabel("遊戲ID (方便隊長辨識)").setStyle(TextInputStyle.Short).setRequired(true); 
-
+        // 加入欄位
         modal.addComponents(
-            new ActionRowBuilder().addComponents(dateInput),
-            new ActionRowBuilder().addComponents(timeInput),
-            new ActionRowBuilder().addComponents(locationInput),
-            new ActionRowBuilder().addComponents(channelInput),
-            new ActionRowBuilder().addComponents(gameIdInput)
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('date').setLabel("日期 (例如：2026-08-11)").setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('time').setLabel("時間 (24小時制，例如：20:30)").setStyle(TextInputStyle.Short).setMaxLength(5).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('location').setLabel("地點 (例如：玩具城深處)").setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('channel').setLabel("頻道 (不確定可填：當日決定)").setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('gameId').setLabel("遊戲ID (方便隊長辨識)").setStyle(TextInputStyle.Short).setRequired(true))
         );
-
         await interaction.showModal(modal);
     }
 
-    // --- 狀況 B：處理表單送出並寫入 Firebase ---
+    // --- 處理表單送出 ---
     else if (interaction.isModalSubmit() && interaction.customId === 'reservationModal') {
-        
-        // 為了避免機器人想太久跳出錯誤，先告訴 Discord「我正在處理中」
-        await interaction.deferReply();
+        await interaction.deferReply(); 
 
-        const date = interaction.fields.getTextInputValue('date');
+        const date = interaction.fields.getTextInputValue('date').replace(/\//g, '-'); // 容錯處理：把斜線換成橫線
         const time = interaction.fields.getTextInputValue('time');
         const location = interaction.fields.getTextInputValue('location');
         const channel = interaction.fields.getTextInputValue('channel');
         const gameId = interaction.fields.getTextInputValue('gameId');
         const discordUserId = interaction.user.id; 
 
-        const newDateTime = new Date(`${date} ${time}`);
+        // 強制轉換為台灣時區 (UTC+8) 的絕對時間，確保跨國主機運算正確
+        const dateString = `${date}T${time}:00+08:00`;
+        const newDateTime = new Date(dateString);
+
         if (isNaN(newDateTime.getTime())) {
-            return interaction.editReply({ content: '❌ **日期或時間格式錯誤**，請確認格式。' });
+            return interaction.editReply({ content: '❌ **日期或時間格式錯誤**，請確認格式（例如：2026-08-11 與 20:30）。' });
         }
 
-        // 1. 從 Firebase 抓取所有現有預約
         const snapshot = await db.collection('reservations').get();
         let reservations = [];
         snapshot.forEach(doc => reservations.push({ id: doc.id, ...doc.data() }));
 
-        // 2. 防呆邏輯：檢查 10 分鐘衝突
+        // 防撞檢查：10 分鐘內地點相同
         const isConflict = reservations.some(res => {
-            const existingDateTime = new Date(`${res.date} ${res.time}`);
-            const timeDiff = Math.abs(newDateTime - existingDateTime);
+            const timeDiff = Math.abs(newDateTime.getTime() - res.timestamp);
             return res.location === location && timeDiff < 10 * 60 * 1000;
         });
 
@@ -93,7 +172,7 @@ client.on('interactionCreate', async interaction => {
             return interaction.editReply({ content: `❌ **預約失敗**：【${location}】在這個時段的前後 10 分鐘內已經有人預約囉！` });
         }
 
-        // 3. 準備要存入資料庫的新資料
+        // 寫入 Firebase (新增 reminded 狀態給鬧鐘判定用)
         const newReservation = {
             discordId: discordUserId,
             gameId: gameId,
@@ -101,83 +180,15 @@ client.on('interactionCreate', async interaction => {
             time: time,
             location: location,
             channel: channel,
-            timestamp: newDateTime.getTime()
+            timestamp: newDateTime.getTime(),
+            reminded: false // 尚未提醒
         };
-
-        // 4. 正式寫入 Firebase Firestore
         await db.collection('reservations').add(newReservation);
-        
-        // 將新資料也加入陣列中以便排序顯示
         reservations.push(newReservation);
 
-        // 5. 排序邏輯
-        reservations.sort((a, b) => a.timestamp - b.timestamp);
-
-        // 6. 組合班表
-        let scheduleText = '';
-        reservations.forEach((res, index) => {
-            scheduleText += `**${index + 1}. [${res.date} ${res.time}] ${res.location}**\n`;
-            scheduleText += `> 頻道：${res.channel} | 遊戲ID：${res.gameId} | 聯絡：<@${res.discordId}>\n\n`;
-        });
-
-        const embed = new EmbedBuilder()
-            .setColor(0x0099FF)
-            .setTitle('📅 最新王團自動排班表')
-            .setDescription(scheduleText)
-            .setTimestamp();
-
-        // 7. 更新回覆
-        await interaction.editReply({ content: `✅ 預約成功！資料已永久儲存至雲端。`, embeds: [embed] });
-    }
-});
-
-client.login(process.env.DISCORD_TOKEN);
-
-    // ==========================================
-    // 狀況 B：玩家填完表單按下了「送出」
-    // ==========================================
-    else if (interaction.isModalSubmit()) {
-        if (interaction.customId === 'reservationModal') {
-            
-            // 抓取玩家填寫的資料
-            const location = interaction.fields.getTextInputValue('location');
-            const time = interaction.fields.getTextInputValue('time');
-            const channel = interaction.fields.getTextInputValue('channel');
-            const proxy = interaction.fields.getTextInputValue('proxy') || '無';
-            const user = interaction.user.username;
-
-            // 1. 將新資料加入班表陣列
-            reservations.push({
-                user: user,
-                location: location,
-                time: time,
-                channel: channel,
-                proxy: proxy
-            });
-
-            // 2. 進行「時間排序」 (按照 00:00 ~ 23:59 排序)
-            reservations.sort((a, b) => a.time.localeCompare(b.time));
-
-            // 3. 組合出漂亮的班表文字
-            let scheduleText = '';
-            reservations.forEach((res, index) => {
-                scheduleText += `**${index + 1}. [${res.time}] ${res.location}**\n`;
-                scheduleText += `> 頻道：${res.channel} | 預約人：${res.user} | 代約：${res.proxy}\n\n`;
-            });
-
-            // 4. 建立排版精美的 Embed 訊息
-            const embed = new EmbedBuilder()
-                .setColor(0x0099FF)
-                .setTitle('📅 今日王團自動排班表')
-                .setDescription(scheduleText.length > 0 ? scheduleText : '目前還沒有人預約喔！')
-                .setTimestamp();
-
-            // 5. 回覆玩家並貼出最新班表
-            await interaction.reply({ 
-                content: `✅ 預約成功！最新班表如下：`, 
-                embeds: [embed] 
-            });
-        }
+        // 產生公開版班表 (隱私遮罩)
+        const embed = generateScheduleEmbed(reservations, false);
+        await interaction.editReply({ content: `✅ 預約成功！排班表已更新。`, embeds: [embed] });
     }
 });
 
