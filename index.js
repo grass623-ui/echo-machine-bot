@@ -10,6 +10,10 @@ const {
 // 1. 初始化 Firebase 資料庫
 // ==========================================
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+
+// 🔥 加入這行魔法程式碼：把被 Render 弄壞的換行符號修好 🔥
+serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+
 admin.initializeApp({
     credential: admin.credential.cert(serviceAccount)
 });
