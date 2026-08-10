@@ -11,8 +11,15 @@ const {
 // ==========================================
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
-// 🔥 加入這行魔法程式碼：把被 Render 弄壞的換行符號修好 🔥
-serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+// 🔥 終極修復魔法：不管手機把密碼弄得多亂，我們都把它重新組裝 🔥
+let rawKey = serviceAccount.private_key;
+// 步驟 A：把所有的空白、真實換行、文字 \n 全部拔除
+rawKey = rawKey.replace(/\\n/g, '').replace(/\n/g, '').replace(/\s/g, '');
+// 步驟 B：把頭尾的文字標籤拿掉，只保留中間的純密碼
+rawKey = rawKey.replace('-----BEGINPRIVATEKEY-----', '').replace('-----ENDPRIVATEKEY-----', '');
+// 步驟 C：每 64 個字元強制換行 (這是 Firebase 要求的標準密碼格式)
+const chunks = rawKey.match(/.{1,64}/g);
+serviceAccount.private_key = '-----BEGIN PRIVATE KEY-----\n' + chunks.join('\n') + '\n-----END PRIVATE KEY-----\n';
 
 admin.initializeApp({
     credential: admin.credential.cert(serviceAccount)
