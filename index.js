@@ -1,12 +1,24 @@
 require('dotenv').config();
 const express = require('express');
+const admin = require('firebase-admin');
 const { 
-    Client, GatewayIntentBits, Partials, 
+    Client, GatewayIntentBits, 
     ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder, EmbedBuilder 
 } = require('discord.js');
 
 // ==========================================
-// 1. Web 伺服器 (維持 UptimeRobot 喚醒用)
+// 1. 初始化 Firebase 資料庫
+// ==========================================
+// 從 Render 的環境變數讀取金鑰並解析
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount)
+});
+const db = admin.firestore();
+console.log('✅ Firebase 資料庫連線成功！');
+
+// ==========================================
+// 2. Web 伺服器 (維持 UptimeRobot 喚醒用)
 // ==========================================
 const app = express();
 const port = process.env.PORT || 3000;
@@ -14,91 +26,112 @@ app.get('/', (req, res) => res.send('Bot is currently alive and running!'));
 app.listen(port, () => console.log(`[Web Server] Listening on port ${port}`));
 
 // ==========================================
-// 2. 班表記憶體 (暫存預約資料用)
-// ==========================================
-// 注意：目前暫存在記憶體，若機器人重啟資料會清空。後續可升級為資料庫。
-let reservations = []; 
-
-// ==========================================
 // 3. Discord 機器人核心邏輯
 // ==========================================
-const client = new Client({
-    intents: [GatewayIntentBits.Guilds], // 使用斜線指令只需要基礎 Guilds 權限即可
-});
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-// 當機器人啟動完成
 client.once('ready', async () => {
     console.log(`[Bot] Logged in as ${client.user.tag}!`);
+    const commands = [{ name: '預約', description: '開啟王團預約表單' }];
+    await client.application.commands.set(commands);
+});
+
+client.on('interactionCreate', async interaction => {
     
-    // 向 Discord 註冊「/預約」這個斜線指令
-    const commands = [{
-        name: '預約',
-        description: '開啟王團預約表單'
-    }];
-    
-    try {
-        await client.application.commands.set(commands);
-        console.log('✅ 成功註冊斜線指令：/預約');
-    } catch (error) {
-        console.error('❌ 註冊指令失敗：', error);
+    // --- 狀況 A：彈出對話框 ---
+    if (interaction.isChatInputCommand() && interaction.commandName === '預約') {
+        const modal = new ModalBuilder().setCustomId('reservationModal').setTitle('📝 王團預約表單');
+
+        const dateInput = new TextInputBuilder().setCustomId('date').setLabel("日期 (例如：08/11 或 2026-08-11)").setStyle(TextInputStyle.Short).setRequired(true);
+        const timeInput = new TextInputBuilder().setCustomId('time').setLabel("時間 (24小時制，例如：20:30)").setStyle(TextInputStyle.Short).setMaxLength(5).setRequired(true);
+        const locationInput = new TextInputBuilder().setCustomId('location').setLabel("地點 (例如：玩具城深處)").setStyle(TextInputStyle.Short).setRequired(true);
+        const channelInput = new TextInputBuilder().setCustomId('channel').setLabel("頻道 (不確定可填：當日決定)").setStyle(TextInputStyle.Short).setRequired(true);
+        const gameIdInput = new TextInputBuilder().setCustomId('gameId').setLabel("遊戲ID (方便隊長辨識)").setStyle(TextInputStyle.Short).setRequired(true); 
+
+        modal.addComponents(
+            new ActionRowBuilder().addComponents(dateInput),
+            new ActionRowBuilder().addComponents(timeInput),
+            new ActionRowBuilder().addComponents(locationInput),
+            new ActionRowBuilder().addComponents(channelInput),
+            new ActionRowBuilder().addComponents(gameIdInput)
+        );
+
+        await interaction.showModal(modal);
+    }
+
+    // --- 狀況 B：處理表單送出並寫入 Firebase ---
+    else if (interaction.isModalSubmit() && interaction.customId === 'reservationModal') {
+        
+        // 為了避免機器人想太久跳出錯誤，先告訴 Discord「我正在處理中」
+        await interaction.deferReply();
+
+        const date = interaction.fields.getTextInputValue('date');
+        const time = interaction.fields.getTextInputValue('time');
+        const location = interaction.fields.getTextInputValue('location');
+        const channel = interaction.fields.getTextInputValue('channel');
+        const gameId = interaction.fields.getTextInputValue('gameId');
+        const discordUserId = interaction.user.id; 
+
+        const newDateTime = new Date(`${date} ${time}`);
+        if (isNaN(newDateTime.getTime())) {
+            return interaction.editReply({ content: '❌ **日期或時間格式錯誤**，請確認格式。' });
+        }
+
+        // 1. 從 Firebase 抓取所有現有預約
+        const snapshot = await db.collection('reservations').get();
+        let reservations = [];
+        snapshot.forEach(doc => reservations.push({ id: doc.id, ...doc.data() }));
+
+        // 2. 防呆邏輯：檢查 10 分鐘衝突
+        const isConflict = reservations.some(res => {
+            const existingDateTime = new Date(`${res.date} ${res.time}`);
+            const timeDiff = Math.abs(newDateTime - existingDateTime);
+            return res.location === location && timeDiff < 10 * 60 * 1000;
+        });
+
+        if (isConflict) {
+            return interaction.editReply({ content: `❌ **預約失敗**：【${location}】在這個時段的前後 10 分鐘內已經有人預約囉！` });
+        }
+
+        // 3. 準備要存入資料庫的新資料
+        const newReservation = {
+            discordId: discordUserId,
+            gameId: gameId,
+            date: date,
+            time: time,
+            location: location,
+            channel: channel,
+            timestamp: newDateTime.getTime()
+        };
+
+        // 4. 正式寫入 Firebase Firestore
+        await db.collection('reservations').add(newReservation);
+        
+        // 將新資料也加入陣列中以便排序顯示
+        reservations.push(newReservation);
+
+        // 5. 排序邏輯
+        reservations.sort((a, b) => a.timestamp - b.timestamp);
+
+        // 6. 組合班表
+        let scheduleText = '';
+        reservations.forEach((res, index) => {
+            scheduleText += `**${index + 1}. [${res.date} ${res.time}] ${res.location}**\n`;
+            scheduleText += `> 頻道：${res.channel} | 遊戲ID：${res.gameId} | 聯絡：<@${res.discordId}>\n\n`;
+        });
+
+        const embed = new EmbedBuilder()
+            .setColor(0x0099FF)
+            .setTitle('📅 最新王團自動排班表')
+            .setDescription(scheduleText)
+            .setTimestamp();
+
+        // 7. 更新回覆
+        await interaction.editReply({ content: `✅ 預約成功！資料已永久儲存至雲端。`, embeds: [embed] });
     }
 });
 
-// 監聽玩家互動 (輸入指令 或 送出表單)
-client.on('interactionCreate', async interaction => {
-    
-    // ==========================================
-    // 狀況 A：玩家輸入了 /預約，我們要彈出對話框
-    // ==========================================
-    if (interaction.isChatInputCommand()) {
-        if (interaction.commandName === '預約') {
-            
-            // 建立對話框 (Modal)
-            const modal = new ModalBuilder()
-                .setCustomId('reservationModal')
-                .setTitle('📝 王團預約表單');
-
-            // 建立輸入欄位：地點
-            const locationInput = new TextInputBuilder()
-                .setCustomId('location')
-                .setLabel("地點 (例如：玩具城深處)")
-                .setStyle(TextInputStyle.Short)
-                .setRequired(true);
-
-            // 建立輸入欄位：時間
-            const timeInput = new TextInputBuilder()
-                .setCustomId('time')
-                .setLabel("時間 (請用 24小時制，例如：20:30)")
-                .setStyle(TextInputStyle.Short)
-                .setMaxLength(5)
-                .setRequired(true);
-
-            // 建立輸入欄位：頻道
-            const channelInput = new TextInputBuilder()
-                .setCustomId('channel')
-                .setLabel("頻道 (不確定可填：當日決定)")
-                .setStyle(TextInputStyle.Short)
-                .setRequired(true);
-
-            // 建立輸入欄位：代約
-            const proxyInput = new TextInputBuilder()
-                .setCustomId('proxy')
-                .setLabel("代約 (無則填無，有則填寫遊戲ID)")
-                .setStyle(TextInputStyle.Short)
-                .setRequired(false); // 這個欄位選填
-
-            // 將欄位加入對話框
-            modal.addComponents(
-                new ActionRowBuilder().addComponents(locationInput),
-                new ActionRowBuilder().addComponents(timeInput),
-                new ActionRowBuilder().addComponents(channelInput),
-                new ActionRowBuilder().addComponents(proxyInput)
-            );
-
-            // 顯示對話框給玩家
-            await interaction.showModal(modal);
-        }
-    }
+client.login(process.env.DISCORD_TOKEN);
 
     // ==========================================
     // 狀況 B：玩家填完表單按下了「送出」
