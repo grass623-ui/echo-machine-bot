@@ -66,6 +66,7 @@ async function addViolation(discordId) {
     return { points, bannedUntil };
 }
 
+// 組合排班表 (時間軸版)
 function generateScheduleEmbed(reservations, isAdmin = false) {
     const now = Date.now();
     const tw = getTaiwanTime();
@@ -101,9 +102,9 @@ function generateScheduleEmbed(reservations, isAdmin = false) {
 
     let scheduleText = '';
     for (const [date, items] of Object.entries(grouped)) {
-        scheduleText += `\n**📅 ${date}**\n`;
+        scheduleText += `\n**📅 ${date}**\n\n`;
         items.forEach((res) => {
-            const noteText = res.notes && res.notes !== '無' ? `\n> 備註：${res.notes}` : '';
+            const noteText = res.notes && res.notes !== '無' ? ` | 備註：${res.notes}` : '';
             
             let channelDisplay = '';
             let playerInfo = '';
@@ -111,14 +112,15 @@ function generateScheduleEmbed(reservations, isAdmin = false) {
             if (isAdmin) {
                 const userStats = stats[res.discordId];
                 channelDisplay = ` | 頻道：${res.channel || '當日決定'}`;
-                playerInfo = `遊戲ID：${res.gameId} | 聯絡：<@${res.discordId}> | 本月預約迴響次數：${userStats.month} | 歷史總次數：${userStats.total}`;
+                playerInfo = `ID：${res.gameId} | <@${res.discordId}> | 本月：${userStats.month}次 | 總：${userStats.total}次`;
             } else {
-                // 公開看板隱藏頻道
                 channelDisplay = ''; 
                 playerInfo = `👤 🔒 匿名玩家`;
             }
             
-            scheduleText += `> \`${res.time}\` | ${res.location}${channelDisplay} | ${playerInfo}${noteText}\n`;
+            // 全新時間軸排版設計
+            scheduleText += `🕒 \`${res.time}\` ── **【${res.location}】**\n`;
+            scheduleText += ` └─ ${playerInfo}${channelDisplay}${noteText}\n\n`;
         });
     }
 
@@ -141,7 +143,6 @@ async function updateBoard() {
             const channel = await client.channels.fetch(channelId).catch(() => null);
             if (channel) {
                 const msg = await channel.messages.fetch(messageId).catch(() => null);
-                // 公開看板加上引導文案與預約按鈕
                 if (msg) await msg.edit({ content: publicBoardIntro, embeds: [generateScheduleEmbed(reservations, false)], components: [reserveBtnRow] });
             }
         }
@@ -291,10 +292,10 @@ client.on('interactionCreate', async interaction => {
             .addFields(
                 { name: '本月預約', value: `${month} 次`, inline: true },
                 { name: '歷史總預約', value: `${total} 次`, inline: true },
-                { name: '緊急調度 (30分內異動)', value: `${points} / 3 次`, inline: false },
+                { name: '臨時調整紀錄', value: `${points} / 3 次`, inline: false },
                 { name: '帳號排單狀態', value: banStatus, inline: false }
             )
-            .setFooter({ text: '※ 為了維護排班順暢，開打前 30 分鐘內的臨時異動會產生調度紀錄，滿 3 次系統會暫停預約功能 7 天當作休息喔！' });
+            .setFooter({ text: '※ 為了維護排班順暢，開打前 30 分鐘內的臨時調整滿 3 次系統會暫停預約功能 7 天當作休息喔！' });
 
         await interaction.editReply({ embeds: [statEmbed] });
     }
@@ -303,14 +304,13 @@ client.on('interactionCreate', async interaction => {
     // 處理：點擊看板「預約」按鈕 -> 彈出下拉選單
     // =====================================
     else if (interaction.isButton() && interaction.customId === 'btn_reserve') {
-        // 檢查權限是否被封鎖
         const userDoc = await db.collection('users').doc(interaction.user.id).get();
         if (userDoc.exists) {
             const ud = userDoc.data();
             if (ud.bannedUntil && ud.bannedUntil > Date.now()) {
                 const bDate = new Date(ud.bannedUntil + 8 * 3600 * 1000);
                 const banTimeStr = `${bDate.getUTCFullYear()}-${String(bDate.getUTCMonth()+1).padStart(2,'0')}-${String(bDate.getUTCDate()).padStart(2,'0')} ${String(bDate.getUTCHours()).padStart(2,'0')}:${String(bDate.getUTCMinutes()).padStart(2,'0')}`;
-                return interaction.reply({ content: `💡 **溫馨提醒**：由於您近期的「緊急調度紀錄」已達上限，系統已暫停您的預約權限至 \`${banTimeStr}\`。這段時間請先好好休息，屆時就可以再次預約囉！`, ephemeral: true });
+                return interaction.reply({ content: `💡 **溫馨提醒**：由於您近期的「臨時調整」紀錄已達上限，系統已暫停您的預約權限至 \`${banTimeStr}\`。這段時間請先好好休息，屆時就可以再次預約囉！`, ephemeral: true });
             }
         }
 
@@ -356,7 +356,7 @@ client.on('interactionCreate', async interaction => {
             if (ud.bannedUntil && ud.bannedUntil > Date.now()) {
                 const bDate = new Date(ud.bannedUntil + 8 * 3600 * 1000);
                 const banTimeStr = `${bDate.getUTCFullYear()}-${String(bDate.getUTCMonth()+1).padStart(2,'0')}-${String(bDate.getUTCDate()).padStart(2,'0')} ${String(bDate.getUTCHours()).padStart(2,'0')}:${String(bDate.getUTCMinutes()).padStart(2,'0')}`;
-                return interaction.reply({ content: `💡 **溫馨提醒**：由於您近期的「緊急調度紀錄」已達上限，系統已暫停您的預約權限至 \`${banTimeStr}\`。這段時間請先好好休息，屆時就可以再次預約囉！`, ephemeral: true });
+                return interaction.reply({ content: `💡 **溫馨提醒**：由於您近期的「臨時調整」紀錄已達上限，系統已暫停您的預約權限至 \`${banTimeStr}\`。這段時間請先好好休息，屆時就可以再次預約囉！`, ephemeral: true });
             }
         }
 
@@ -468,15 +468,9 @@ client.on('interactionCreate', async interaction => {
             if (isLastMinute) {
                 const { points, bannedUntil } = await addViolation(interaction.user.id);
                 if (bannedUntil) {
-                    replyText += `\n\n💡 **系統通知**：由於您近期的「緊急調度紀錄」已滿 3 次，為了維護整體排班順暢，系統已暫時暫停您的預約權限 7 天。這段時間請先好好休息，7 天後就可以再次使用囉！`;
+                    replyText += `\n\n💡 **系統通知**：\n由於您近期的「臨時調整」紀錄已滿 3 次，為了維護整體排班順暢，系統已暫時暫停您的預約權限 7 天。\n這段時間請先好好休息，7 天後就可以再次使用囉！`;
                 } else {
-                    replyText += `\n\n💡 **溫馨小提醒**：由於此次取消距離開打不到 30 分鐘，系統已記錄一次「緊急調度」（目前累計：${points}/3）。為了讓大家都有良好的打王體驗，滿 3 次將會暫停預約權限 7 天喔，感謝您的體諒與配合！`;
-                }
-                
-                const boardDoc = await db.collection('settings').doc('board').get();
-                if (boardDoc.exists) {
-                    const channel = await client.channels.fetch(boardDoc.data().channelId).catch(() => null);
-                    if (channel) await channel.send(`📢 **【臨時釋出候補】**\n原本預約的【${data.location}】\`${data.date} ${data.time}\` 時段剛剛釋出囉！有人剛好要接手嗎？\n*(欲接手請直接點擊上方看板的預約按鈕重新登記)*`);
+                    replyText += `\n\n💡 **溫馨小提醒**：\n由於此次取消距離開打不到 30 分鐘，系統已記錄一次臨時調整（目前累計：${points}/3）。\n滿 3 次將會暫停預約權限 7 天喔，感謝體諒與配合！`;
                 }
             }
 
@@ -551,15 +545,9 @@ client.on('interactionCreate', async interaction => {
         if (timeChanged && isLastMinute) {
             const { points, bannedUntil } = await addViolation(interaction.user.id);
             if (bannedUntil) {
-                replyText += `\n\n💡 **系統通知**：由於您近期的「緊急調度紀錄」已滿 3 次，為了維護整體排班順暢，系統已暫停您的預約權限 7 天（本次更改仍會生效）。這段時間請先好好休息囉！`;
+                replyText += `\n\n💡 **系統通知**：\n由於您近期的「臨時調整」紀錄已滿 3 次，為了維護整體排班順暢，系統已暫停您的預約權限 7 天（本次更改仍會生效）。\n這段時間請先好好休息囉！`;
             } else {
-                replyText += `\n\n💡 **溫馨小提醒**：由於此次更改時間距離原本開打不到 30 分鐘，系統已記錄一次「緊急調度」（目前累計：${points}/3）。滿 3 次將會暫停預約權限 7 天喔，感謝體諒與配合！`;
-            }
-            
-            const boardDoc = await db.collection('settings').doc('board').get();
-            if (boardDoc.exists) {
-                const channel = await client.channels.fetch(boardDoc.data().channelId).catch(() => null);
-                if (channel) await channel.send(`📢 **【臨時釋出候補】**\n原本預約的【${currentLocation}】\`${data.date} ${data.time}\` 時段剛剛釋出了空檔，有人要接手嗎？\n*(欲接手請直接點擊上方看板的預約按鈕重新登記)*`);
+                replyText += `\n\n💡 **溫馨小提醒**：\n由於此次更改時間距離原本開打不到 30 分鐘，系統已記錄一次臨時調整（目前累計：${points}/3）。\n滿 3 次將會暫停預約權限 7 天喔，感謝體諒與配合！`;
             }
         }
 
