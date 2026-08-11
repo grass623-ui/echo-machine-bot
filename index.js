@@ -46,6 +46,23 @@ function getTaiwanTime() {
     };
 }
 
+// 處理違規記點與封鎖的函數
+async function addViolation(discordId) {
+    const userRef = db.collection('users').doc(discordId);
+    const doc = await userRef.get();
+    let points = 1;
+    let bannedUntil = null;
+    if (doc.exists) {
+        points = (doc.data().violationPoints || 0) + 1;
+    }
+    if (points >= 3) {
+        bannedUntil = Date.now() + 7 * 24 * 60 * 60 * 1000; // 封鎖 7 天
+        points = 0; // 封鎖後歸零
+    }
+    await userRef.set({ violationPoints: points, bannedUntil: bannedUntil }, { merge: true });
+    return { points, bannedUntil };
+}
+
 // 組合排班表
 function generateScheduleEmbed(reservations, isAdmin = false) {
     const now = Date.now();
@@ -66,9 +83,7 @@ function generateScheduleEmbed(reservations, isAdmin = false) {
         .filter(res => res.timestamp >= now) 
         .sort((a, b) => a.timestamp - b.timestamp);
 
-    if (!isAdmin) {
-        futureRes = futureRes.filter(res => res.date === todayStr);
-    }
+    if (!isAdmin) futureRes = futureRes.filter(res => res.date === todayStr);
 
     if (futureRes.length === 0) {
         return new EmbedBuilder()
@@ -149,6 +164,7 @@ client.once('ready', async () => {
                 choices: [ { name: '闇黑龍王', value: '闇黑龍王' }, { name: '艾畢奈亞', value: '艾畢奈亞' }, { name: '道館', value: '道館' }, { name: '其他', value: '其他' } ]
             }]
         },
+        { name: '我的紀錄', description: '查詢個人的預約統計與違規記點' },
         {
             name: '價格', description: '設定各王團地點的預設價格 (管理員)',
             options: [
@@ -181,8 +197,8 @@ client.once('ready', async () => {
                 if (timeDiff <= 15 * 60 * 1000 && timeDiff > 0) {
                     try {
                         const price = prices[data.location] || '未設定';
-                        
                         const user = await client.users.fetch(data.discordId);
+                        
                         await user.send(`🔔 **王團預約提醒鬧鐘**\n您預約的【${data.location}】將在 15 分鐘後（\`${data.date} ${data.time}\`）開始，請備妥 ${price}萬 楓幣給迴響機！`).catch(console.error);
                         
                         if (echoAdminId) {
@@ -191,7 +207,6 @@ client.once('ready', async () => {
                             const pre5MinStr = String(twPre5Obj.getUTCHours()).padStart(2, '0') + ':' + String(twPre5Obj.getUTCMinutes()).padStart(2, '0');
                             
                             const echoUser = await client.users.fetch(echoAdminId);
-                            // 在這裡直接使用 <@ID> 來標記該玩家
                             await echoUser.send(`🔔 **王團提醒訂單鬧鐘**\n<@${data.discordId}> 與您預約的【${data.location}】將在 15 分鐘後（\`${data.date} ${data.time}\`）需要施放迴響！\n請記得於（\`${data.date} ${pre5MinStr}\`）上線並準備施放 **英雄的迴響** 喔！`).catch(console.error);
                         }
                         await db.collection('reservations').doc(doc.id).update({ reminded: true });
@@ -204,7 +219,9 @@ client.once('ready', async () => {
 
 client.on('interactionCreate', async interaction => {
     
-    // 指令處理：註冊、看板、價格
+    // =====================================
+    // 獨立指令處理
+    // =====================================
     if (interaction.isChatInputCommand() && interaction.commandName === '註冊迴響機') {
         if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.reply({ content: '❌ 權限不足', ephemeral: true });
         await db.collection('settings').doc('echoAdmin').set({ discordId: interaction.user.id });
@@ -229,9 +246,59 @@ client.on('interactionCreate', async interaction => {
         await db.collection('settings').doc('prices').set({ [loc]: price }, { merge: true });
         await interaction.reply({ content: `✅ 已將【${loc}】的價格設定為 **${price}萬** 楓幣。`, ephemeral: true });
     }
+    else if (interaction.isChatInputCommand() && interaction.commandName === '我的紀錄') {
+        await interaction.deferReply({ ephemeral: true });
+        const snapshot = await db.collection('reservations').where('discordId', '==', interaction.user.id).get();
+        const tw = getTaiwanTime();
+        const currentMonthPrefix = `${tw.yyyy}-${tw.mm}`;
+        let total = 0, month = 0;
+        
+        snapshot.forEach(doc => {
+            total++;
+            if (doc.data().date.startsWith(currentMonthPrefix)) month++;
+        });
 
-    // 指令處理：預約表單
+        const userDoc = await db.collection('users').doc(interaction.user.id).get();
+        let points = 0;
+        let banStatus = '🟢 正常 (無封鎖限制)';
+        if (userDoc.exists) {
+            const ud = userDoc.data();
+            points = ud.violationPoints || 0;
+            if (ud.bannedUntil && ud.bannedUntil > Date.now()) {
+                const bDate = new Date(ud.bannedUntil + 8 * 3600 * 1000);
+                banStatus = `🔴 權限受限 (解除時間：${bDate.getUTCFullYear()}-${String(bDate.getUTCMonth()+1).padStart(2,'0')}-${String(bDate.getUTCDate()).padStart(2,'0')} ${String(bDate.getUTCHours()).padStart(2,'0')}:${String(bDate.getUTCMinutes()).padStart(2,'0')})`;
+            }
+        }
+
+        const statEmbed = new EmbedBuilder()
+            .setColor(0x9B59B6)
+            .setTitle(`📊 ${interaction.user.username} 的預約數據面板`)
+            .addFields(
+                { name: '本月預約', value: `${month} 次`, inline: true },
+                { name: '歷史總預約', value: `${total} 次`, inline: true },
+                { name: '違規記點', value: `${points} / 3 點`, inline: false },
+                { name: '帳號狀態', value: banStatus, inline: false }
+            )
+            .setFooter({ text: '※ 若於開打 30 分鐘內臨時異動或取消，系統將自動記 1 點。滿 3 點封鎖預約權限 7 天。' });
+
+        await interaction.editReply({ embeds: [statEmbed] });
+    }
+
+    // =====================================
+    // 預約表單處理
+    // =====================================
     else if (interaction.isChatInputCommand() && interaction.commandName === '預約') {
+        // 先檢查是否被封鎖
+        const userDoc = await db.collection('users').doc(interaction.user.id).get();
+        if (userDoc.exists) {
+            const ud = userDoc.data();
+            if (ud.bannedUntil && ud.bannedUntil > Date.now()) {
+                const bDate = new Date(ud.bannedUntil + 8 * 3600 * 1000);
+                const banTimeStr = `${bDate.getUTCFullYear()}-${String(bDate.getUTCMonth()+1).padStart(2,'0')}-${String(bDate.getUTCDate()).padStart(2,'0')} ${String(bDate.getUTCHours()).padStart(2,'0')}:${String(bDate.getUTCMinutes()).padStart(2,'0')}`;
+                return interaction.reply({ content: `❌ **權限受限**：因您近期多次臨時取消或異動，觸發系統保護機制。您的預約功能已被暫停至 \`${banTimeStr}\`。`, ephemeral: true });
+            }
+        }
+
         const location = interaction.options.getString('地點');
         const modal = new ModalBuilder().setCustomId(`reserve_${location}`).setTitle(`📝 預約：${location}`);
         const tw = getTaiwanTime();
@@ -259,8 +326,6 @@ client.on('interactionCreate', async interaction => {
         const newDateTime = new Date(`${date}T${time}:00+08:00`);
 
         if (isNaN(newDateTime.getTime())) return interaction.reply({ content: '❌ **日期或時間格式錯誤**。', ephemeral: true });
-        
-        // 防呆設計：禁止預約過去的時間
         if (newDateTime.getTime() <= Date.now()) return interaction.reply({ content: '❌ **無法預約過去的時間**，請設定未來的時刻。', ephemeral: true });
 
         const snapshot = await db.collection('reservations').get();
@@ -278,14 +343,11 @@ client.on('interactionCreate', async interaction => {
             timestamp: newDateTime.getTime(), reminded: false
         });
         
-        // 按鈕順序：更改時間 / 取消預約 / 頻道設定
         const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`updTime_${docRef.id}`).setLabel('⌚ 更改時間').setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId(`cancel_${docRef.id}`).setLabel('🗑️ 取消預約').setStyle(ButtonStyle.Danger),
-            new ButtonBuilder().setCustomId(`updChan_${docRef.id}`).setLabel('✏️ 頻道設定').setStyle(ButtonStyle.Primary)
+            new ButtonBuilder().setCustomId(`edit_${docRef.id}`).setLabel('✏️ 變更登記資料').setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId(`cancel_${docRef.id}`).setLabel('🗑️ 取消預約').setStyle(ButtonStyle.Danger)
         );
 
-        // 精簡版卡片文字
         const embed = new EmbedBuilder()
             .setColor(0x00FF00).setTitle('✅ 預約已送出')
             .setDescription(`**地點**：${location}\n**時間**：${date} ${time}\n**頻道**：${channel || '未填寫 (當日決定)'}`);
@@ -300,7 +362,9 @@ client.on('interactionCreate', async interaction => {
         updateBoard(); 
     }
 
-    // 處理：真實私訊(DM)內的按鈕點擊
+    // =====================================
+    // 私訊(DM)內的按鈕與表單處理
+    // =====================================
     else if (interaction.isButton()) {
         const [action, docId] = interaction.customId.split('_');
         
@@ -309,61 +373,74 @@ client.on('interactionCreate', async interaction => {
         
         const data = doc.data();
 
-        // 檢查訂單是否已過期 (自動轉化為歷史紀錄)
         if (data.timestamp < Date.now()) {
             const expiredEmbed = new EmbedBuilder()
                 .setColor(0x808080)
                 .setTitle('📜 歷史預約紀錄')
                 .setDescription(`**地點**：${data.location}\n**時間**：${data.date} ${data.time}\n**頻道**：${data.channel || '未填寫 (當日決定)'}\n\n*此預約時間已過，無法再進行更改。*`);
-            
-            // 將卡片更新為歷史紀錄，並清空所有按鈕
             return interaction.update({ embeds: [expiredEmbed], components: [] });
         }
         
+        const isLastMinute = (data.timestamp - Date.now()) <= 30 * 60 * 1000;
+
         if (action === 'cancel') {
             await db.collection('reservations').doc(docId).delete();
-            await interaction.update({ content: '✅ **這筆訂單已成功取消**，伺服器排班表已同步刷新。', embeds: [], components: [] });
+            
+            const cancelEmbed = new EmbedBuilder()
+                .setColor(0xFF0000)
+                .setTitle('🚫 訂單已取消')
+                .setDescription(`**地點**：${data.location}\n**時間**：${data.date} ${data.time}\n**頻道**：${data.channel || '未填寫 (當日決定)'}`);
+            
+            let replyText = '✅ **這筆訂單已成功取消**，伺服器排班表已同步刷新。';
+            
+            // 臨時取消記點與候補廣播
+            if (isLastMinute) {
+                const { points, bannedUntil } = await addViolation(interaction.user.id);
+                if (bannedUntil) {
+                    replyText += `\n\n⚠️ **系統警告**：此次操作屬「開打前 30 分鐘內」臨時異動，記 1 點違規。**累計達 3 點，您的預約權限已被封鎖 7 天！**`;
+                } else {
+                    replyText += `\n\n⚠️ **系統提醒**：此次操作屬「開打前 30 分鐘內」臨時異動，已記 1 點違規（目前累計：${points}/3）。滿 3 點將封鎖權限 7 天，請多加留意。`;
+                }
+                
+                const boardDoc = await db.collection('settings').doc('board').get();
+                if (boardDoc.exists) {
+                    const channel = await client.channels.fetch(boardDoc.data().channelId).catch(() => null);
+                    if (channel) await channel.send(`📢 **【臨時釋出候補】**\n原本預約的【${data.location}】\`${data.date} ${data.time}\` 時段剛剛釋出囉！有人要接手嗎？\n*(欲接手請直接使用 \`/預約\` 指令重新登記)*`);
+                }
+            }
+
+            await interaction.update({ embeds: [cancelEmbed], components: [] });
+            await interaction.followUp({ content: replyText, ephemeral: true });
             updateBoard();
         } 
-        else if (action === 'updChan') {
-            const modal = new ModalBuilder().setCustomId(`submitChan_${docId}`).setTitle('頻道設定');
-            modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('newChannel').setLabel("新頻道").setStyle(TextInputStyle.Short).setValue(data.channel || '').setRequired(true)));
-            await interaction.showModal(modal);
-        }
-        else if (action === 'updTime') {
-            const modal = new ModalBuilder().setCustomId(`submitTime_${docId}`).setTitle('更改預約時間');
+        else if (action === 'edit') {
+            const modal = new ModalBuilder().setCustomId(`submitEdit_${docId}`).setTitle('變更登記資料');
+            
+            const channelInput = new TextInputBuilder().setCustomId('channel').setLabel("幸運頻道").setStyle(TextInputStyle.Short).setRequired(false);
+            if (data.channel) channelInput.setValue(data.channel);
+
+            const notesInput = new TextInputBuilder().setCustomId('notes').setLabel("備註").setStyle(TextInputStyle.Short).setRequired(false);
+            if (data.notes && data.notes !== '無') notesInput.setValue(data.notes);
+
             modal.addComponents(
-                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('newDate').setLabel("新日期 (例如：2026-08-11)").setStyle(TextInputStyle.Short).setValue(data.date).setRequired(true)),
-                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('newTime').setLabel("新時間 (24小時制)").setStyle(TextInputStyle.Short).setValue(data.time).setMaxLength(5).setRequired(true))
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('newDate').setLabel("日期").setStyle(TextInputStyle.Short).setValue(data.date).setRequired(true)),
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('newTime').setLabel("時間 (24小時制)").setStyle(TextInputStyle.Short).setValue(data.time).setMaxLength(5).setRequired(true)),
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('gameId').setLabel("預約者遊戲ID").setStyle(TextInputStyle.Short).setValue(data.gameId).setRequired(true)),
+                new ActionRowBuilder().addComponents(channelInput),
+                new ActionRowBuilder().addComponents(notesInput)
             );
             await interaction.showModal(modal);
         }
     }
 
-    // 處理：更改頻道送出
-    else if (interaction.isModalSubmit() && interaction.customId.startsWith('submitChan_')) {
-        const docId = interaction.customId.split('_')[1];
-        const newChannel = interaction.fields.getTextInputValue('newChannel');
-        
-        await db.collection('reservations').doc(docId).update({ channel: newChannel });
-        await interaction.reply({ content: `✅ 頻道已成功更新為：**${newChannel}**，看板已同步刷新。`, ephemeral: true });
-        
-        // 更新 DM 內的卡片文字
-        const updatedDoc = await db.collection('reservations').doc(docId).get();
-        const data = updatedDoc.data();
-        const embed = new EmbedBuilder()
-            .setColor(0x00FF00).setTitle('✅ 預約已送出')
-            .setDescription(`**地點**：${data.location}\n**時間**：${data.date} ${data.time}\n**頻道**：${newChannel}`);
-        await interaction.message.edit({ embeds: [embed] });
-
-        updateBoard();
-    }
-
-    // 處理：更改時間送出
-    else if (interaction.isModalSubmit() && interaction.customId.startsWith('submitTime_')) {
+    // 處理：變更登記資料表單送出
+    else if (interaction.isModalSubmit() && interaction.customId.startsWith('submitEdit_')) {
         const docId = interaction.customId.split('_')[1];
         const newDate = interaction.fields.getTextInputValue('newDate').replace(/\//g, '-');
         let newTime = interaction.fields.getTextInputValue('newTime');
+        const newGameId = interaction.fields.getTextInputValue('gameId');
+        const newChannel = interaction.fields.getTextInputValue('channel') || '';
+        const newNotes = interaction.fields.getTextInputValue('notes') || '無';
         
         if (newTime.length === 4 && newTime.indexOf(':') === 1) newTime = '0' + newTime;
         const newDateTime = new Date(`${newDate}T${newTime}:00+08:00`);
@@ -373,33 +450,54 @@ client.on('interactionCreate', async interaction => {
 
         const currentDoc = await db.collection('reservations').doc(docId).get();
         if (!currentDoc.exists) return interaction.reply({ content: '❌ 找不到此訂單。', ephemeral: true });
-        const currentLocation = currentDoc.data().location;
+        
+        const data = currentDoc.data();
+        const currentLocation = data.location;
+        const timeChanged = data.timestamp !== newDateTime.getTime();
 
-        const snapshot = await db.collection('reservations').get();
-        let reservations = [];
-        snapshot.forEach(doc => {
-            if (doc.id !== docId) reservations.push({ id: doc.id, ...doc.data() });
-        });
+        if (timeChanged) {
+            const snapshot = await db.collection('reservations').get();
+            let reservations = [];
+            snapshot.forEach(doc => {
+                if (doc.id !== docId) reservations.push({ id: doc.id, ...doc.data() });
+            });
 
-        const isConflict = reservations.some(res => {
-            return res.location === currentLocation && Math.abs(newDateTime.getTime() - res.timestamp) < 10 * 60 * 1000;
-        });
+            const isConflict = reservations.some(res => {
+                return res.location === currentLocation && Math.abs(newDateTime.getTime() - res.timestamp) < 10 * 60 * 1000;
+            });
 
-        if (isConflict) return interaction.reply({ content: '❌ 您申請更改的時間前後10分鐘有訂單，無法進行更改，請重新設定。', ephemeral: true });
+            if (isConflict) return interaction.reply({ content: '❌ 您申請更改的時間前後10分鐘有訂單，無法進行更改，請重新設定。', ephemeral: true });
+        }
 
         await db.collection('reservations').doc(docId).update({ 
-            date: newDate, 
-            time: newTime, 
-            timestamp: newDateTime.getTime(),
-            reminded: false 
+            date: newDate, time: newTime, gameId: newGameId, channel: newChannel, notes: newNotes,
+            timestamp: newDateTime.getTime(), reminded: false 
         });
-        await interaction.reply({ content: `✅ 預約時間已成功更改為：**${newDate} ${newTime}**，看板已同步刷新。`, ephemeral: true });
 
-        // 更新 DM 內的卡片文字
-        const data = currentDoc.data();
+        const isLastMinute = (data.timestamp - Date.now()) <= 30 * 60 * 1000;
+        let replyText = `✅ **變更成功**，看板已同步刷新。`;
+        
+        // 如果臨時更改時間，觸發記點與候補釋出廣播
+        if (timeChanged && isLastMinute) {
+            const { points, bannedUntil } = await addViolation(interaction.user.id);
+            if (bannedUntil) {
+                replyText += `\n\n⚠️ **系統警告**：臨時更改時間記 1 點違規。**累計達 3 點，您的預約權限已被封鎖 7 天！**（本次更改仍生效）`;
+            } else {
+                replyText += `\n\n⚠️ **系統提醒**：臨時更改時間記 1 點違規（目前累計：${points}/3）。滿 3 點將封鎖權限 7 天。`;
+            }
+            
+            const boardDoc = await db.collection('settings').doc('board').get();
+            if (boardDoc.exists) {
+                const channel = await client.channels.fetch(boardDoc.data().channelId).catch(() => null);
+                if (channel) await channel.send(`📢 **【臨時釋出候補】**\n原本預約的【${currentLocation}】\`${data.date} ${data.time}\` 時段剛剛釋出囉！有人要接手嗎？\n*(欲接手請直接使用 \`/預約\` 指令重新登記)*`);
+            }
+        }
+
+        await interaction.reply({ content: replyText, ephemeral: true });
+
         const embed = new EmbedBuilder()
-            .setColor(0x00FF00).setTitle('✅ 預約已送出')
-            .setDescription(`**地點**：${currentLocation}\n**時間**：${newDate} ${newTime}\n**頻道**：${data.channel || '未填寫 (當日決定)'}`);
+            .setColor(0x00FF00).setTitle('✅ 預約已更新')
+            .setDescription(`**地點**：${currentLocation}\n**時間**：${newDate} ${newTime}\n**頻道**：${newChannel || '未填寫 (當日決定)'}`);
         await interaction.message.edit({ embeds: [embed] });
 
         updateBoard();
