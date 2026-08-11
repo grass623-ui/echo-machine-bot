@@ -32,7 +32,7 @@ app.listen(port, () => console.log(`[Web Server] Listening on port ${port}`));
 // ==========================================
 // 3. Discord 機器人核心與功能邏輯
 // ==========================================
-const client = new Client({ intents: [GatewayIntentBits.Guilds], partials: [Partials.Channel] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages], partials: [Partials.Channel] });
 
 function getTaiwanTime() {
     const now = new Date();
@@ -49,12 +49,36 @@ function getTaiwanTime() {
 // 組合排班表
 function generateScheduleEmbed(reservations, isAdmin = false) {
     const now = Date.now();
-    const futureRes = reservations
+    const tw = getTaiwanTime();
+    const todayStr = `${tw.yyyy}-${tw.mm}-${tw.dd}`;
+    const currentMonthPrefix = `${tw.yyyy}-${tw.mm}`;
+
+    // 計算所有玩家的預約次數 (歷史總數與本月總數)
+    const stats = {};
+    reservations.forEach(r => {
+        if (!stats[r.discordId]) stats[r.discordId] = { total: 0, month: 0 };
+        stats[r.discordId].total += 1;
+        if (r.date.startsWith(currentMonthPrefix)) {
+            stats[r.discordId].month += 1;
+        }
+    });
+
+    // 過濾出未來的預約，並排序
+    let futureRes = reservations
         .filter(res => res.timestamp >= now) 
         .sort((a, b) => a.timestamp - b.timestamp);
 
+    // 公開看板：只顯示當日預約
+    if (!isAdmin) {
+        futureRes = futureRes.filter(res => res.date === todayStr);
+    }
+
     if (futureRes.length === 0) {
-        return new EmbedBuilder().setColor(0x0099FF).setTitle(isAdmin ? '🕵️‍♂️ 【管理員限定】真實名單' : '📅 王團自動排班表').setDescription('目前沒有未來的預約喔！').setTimestamp();
+        return new EmbedBuilder()
+            .setColor(0x0099FF)
+            .setTitle(isAdmin ? '👑【管理員】王團自動排班表' : '👤王團自動排班表')
+            .setDescription(isAdmin ? '目前沒有任何未來的預約喔！' : '本日目前沒有未來的預約喔！')
+            .setTimestamp();
     }
 
     const grouped = {};
@@ -67,17 +91,24 @@ function generateScheduleEmbed(reservations, isAdmin = false) {
     for (const [date, items] of Object.entries(grouped)) {
         scheduleText += `\n**📅 ${date}**\n`;
         items.forEach((res) => {
-            const playerInfo = isAdmin ? `遊戲ID：${res.gameId} | 聯絡：<@${res.discordId}>` : `👤 🔒 匿名玩家`;
-            const noteText = res.notes && res.notes !== '無' ? `\n> 備註：${res.notes}` : '';
-            // 頻道顯示邏輯：如果沒有填寫，顯示當日決定
             const displayChannel = res.channel ? res.channel : '當日決定';
+            const noteText = res.notes && res.notes !== '無' ? `\n> 備註：${res.notes}` : '';
+            
+            let playerInfo;
+            if (isAdmin) {
+                const userStats = stats[res.discordId];
+                playerInfo = `遊戲ID：${res.gameId} | 聯絡：<@${res.discordId}> | 本月預約迴響次數：${userStats.month} | 歷史預約迴響次數：${userStats.total}`;
+            } else {
+                playerInfo = `👤 🔒 匿名玩家`;
+            }
+            
             scheduleText += `> \`${res.time}\` | ${res.location} | 頻道：${displayChannel} | ${playerInfo}${noteText}\n`;
         });
     }
 
     return new EmbedBuilder()
         .setColor(isAdmin ? 0xFF0000 : 0x0099FF)
-        .setTitle(isAdmin ? '🕵️‍♂️ 【管理員限定】王團真實名單' : '📅 王團自動排班表')
+        .setTitle(isAdmin ? '👑【管理員】王團自動排班表' : '👤王團自動排班表')
         .setDescription(scheduleText)
         .setTimestamp();
 }
@@ -130,11 +161,10 @@ client.once('ready', async () => {
         },
         { name: '產生看板', description: '產生會自動更新的【公開】班表 (管理員)' },
         { name: '產生管理看板', description: '產生會自動更新的【真實名單】班表 (管理員)' },
-        { name: '註冊迴響機', description: '將自己綁定為接收提醒的迴響機操作員 (管理員)' } // 新增註冊指令
+        { name: '註冊迴響機', description: '將自己綁定為接收提醒的迴響機操作員 (管理員)' } 
     ];
     await client.application.commands.set(commands);
 
-    // 每分鐘巡邏鬧鐘與刷新看板
     setInterval(async () => {
         const now = Date.now();
         await updateBoard(); 
@@ -144,7 +174,6 @@ client.once('ready', async () => {
             const pricesDoc = await db.collection('settings').doc('prices').get();
             const prices = pricesDoc.exists ? pricesDoc.data() : {};
             
-            // 從資料庫抓取迴響機的註冊 ID
             const echoAdminDoc = await db.collection('settings').doc('echoAdmin').get();
             const echoAdminId = echoAdminDoc.exists ? echoAdminDoc.data().discordId : null;
 
@@ -185,7 +214,7 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({ content: '✅ **註冊成功！** 您現在是指定的迴響機操作員，未來將會自動接收提早 5 分鐘的上線通知。', ephemeral: true });
     }
 
-    // --- 指令：產生看板 / 設定價格 ... ---
+    // --- 指令：產生看板 / 設定價格 ---
     else if (interaction.isChatInputCommand() && interaction.commandName === '產生看板') {
         if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.reply({ content: '❌ 權限不足', ephemeral: true });
         const msg = await interaction.reply({ embeds: [new EmbedBuilder().setTitle('載入中...').setColor(0x0099FF)], fetchReply: true });
@@ -212,12 +241,13 @@ client.on('interactionCreate', async interaction => {
         const modal = new ModalBuilder().setCustomId(`reserve_${location}`).setTitle(`📝 預約：${location}`);
         const tw = getTaiwanTime();
         
+        // 重新排版：日期 -> 時間 -> 遊戲ID -> 幸運頻道 -> 備註
         modal.addComponents(
             new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('date').setLabel("日期 (可修改)").setStyle(TextInputStyle.Short).setValue(`${tw.yyyy}-${tw.mm}-${tw.dd}`).setRequired(true)),
             new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('time').setLabel("時間 (24小時制，可修改)").setStyle(TextInputStyle.Short).setValue(`${tw.hh}:${tw.min}`).setMaxLength(5).setRequired(true)),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('channel').setLabel("頻道").setStyle(TextInputStyle.Short).setRequired(false)), // 頻道非必填
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('gameId').setLabel("遊戲ID").setStyle(TextInputStyle.Short).setRequired(true)),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('notes').setLabel("備註").setStyle(TextInputStyle.Short).setRequired(false)) // 備註
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('gameId').setLabel("預約者遊戲ID").setStyle(TextInputStyle.Short).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('channel').setLabel("幸運頻道").setStyle(TextInputStyle.Short).setRequired(false)), 
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('notes').setLabel("備註").setStyle(TextInputStyle.Short).setRequired(false))
         );
         await interaction.showModal(modal);
     }
@@ -227,8 +257,8 @@ client.on('interactionCreate', async interaction => {
         const location = interaction.customId.split('_')[1];
         const date = interaction.fields.getTextInputValue('date').replace(/\//g, '-');
         let time = interaction.fields.getTextInputValue('time');
-        const channel = interaction.fields.getTextInputValue('channel') || ''; // 空白處理
         const gameId = interaction.fields.getTextInputValue('gameId');
+        const channel = interaction.fields.getTextInputValue('channel') || ''; 
         const notes = interaction.fields.getTextInputValue('notes') || '無';
         
         if (time.length === 4 && time.indexOf(':') === 1) time = '0' + time;
@@ -252,7 +282,7 @@ client.on('interactionCreate', async interaction => {
             timestamp: newDateTime.getTime(), reminded: false
         });
         
-        // 建立管理按鈕
+        // 建立私訊管理按鈕
         const row = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId(`cancel_${docRef.id}`).setLabel('🗑️ 取消預約').setStyle(ButtonStyle.Danger),
             new ButtonBuilder().setCustomId(`updChan_${docRef.id}`).setLabel('✏️ 補填/更改頻道').setStyle(ButtonStyle.Primary)
@@ -260,19 +290,27 @@ client.on('interactionCreate', async interaction => {
 
         const embed = new EmbedBuilder()
             .setColor(0x00FF00).setTitle('✅ 預約已送出')
-            .setDescription(`**地點**：${location}\n**時間**：${date} ${time}\n**頻道**：${channel || '未填寫 (看板將顯示當日決定)'}\n\n*您可以使用下方的按鈕隨時管理這筆訂單。*`);
+            .setDescription(`**地點**：${location}\n**時間**：${date} ${time}\n**頻道**：${channel || '未填寫 (看板將顯示當日決定)'}\n\n*您可以點擊下方按鈕隨時管理這筆訂單，若取消訂單將會同步更新伺服器班表。*`);
 
-        await interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
+        try {
+            // 真實私訊發送給使用者
+            await interaction.user.send({ embeds: [embed], components: [row] });
+            await interaction.reply({ content: `✅ 預約成功！排班表已更新。請查看您的 **私訊(DM)** 以管理這筆訂單。`, ephemeral: true });
+        } catch (error) {
+            // 如果玩家關閉了私訊功能，則在頻道內發出警告
+            await interaction.reply({ content: `✅ 預約成功！排班表已更新。\n⚠️ **警告：我們無法發送訂單管理卡片給您，請確認您的隱私設定有開啟「允許來自伺服器成員的私人訊息」。**`, ephemeral: true });
+        }
+        
         updateBoard(); 
     }
 
-    // --- 處理：按鈕點擊 (取消或更改頻道) ---
+    // --- 處理：真實私訊(DM)內的按鈕點擊 ---
     else if (interaction.isButton()) {
         const [action, docId] = interaction.customId.split('_');
         
         if (action === 'cancel') {
             await db.collection('reservations').doc(docId).delete();
-            await interaction.update({ content: '✅ **訂單已成功取消**，排班表將自動刷新。', embeds: [], components: [] });
+            await interaction.update({ content: '✅ **這筆訂單已成功取消**，伺服器排班表已同步刷新。', embeds: [], components: [] });
             updateBoard();
         } 
         else if (action === 'updChan') {
