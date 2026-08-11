@@ -65,7 +65,6 @@ async function addViolation(discordId) {
     return { points, bannedUntil };
 }
 
-// 廣播至所有管理區
 async function broadcastToManagementAreas(messagePayload) {
     const doc = await db.collection('settings').doc('managementArea').get();
     if (!doc.exists) return [];
@@ -81,7 +80,6 @@ async function broadcastToManagementAreas(messagePayload) {
     return sentMsgs;
 }
 
-// 同步更新管理員卡片
 async function syncManagementMessages(msgRefs, newEmbed, newComponents = []) {
     if (!msgRefs || !Array.isArray(msgRefs)) return;
     for (const m of msgRefs) {
@@ -95,7 +93,6 @@ async function syncManagementMessages(msgRefs, newEmbed, newComponents = []) {
     }
 }
 
-// 直接修改玩家的私訊卡片
 async function editUserDM(discordId, messageId, payload) {
     if (!messageId) return;
     try {
@@ -205,6 +202,7 @@ client.once('ready', async () => {
             options: [{ name: '地點', type: 3, description: '請選擇預約地點', required: true, choices: [ { name: '闇黑龍王', value: '闇黑龍王' }, { name: '艾畢奈亞', value: '艾畢奈亞' }, { name: '道館', value: '道館' }, { name: '其他', value: '其他' } ] }]
         },
         { name: '我的紀錄', description: '查詢個人的預約統計與排單狀態' },
+        { name: '接單統計', description: '查詢各專員的接單與完成數量 (管理員)' },
         { name: '產生看板', description: '產生會自動更新的【公開】預約看板與按鈕 (管理員)' },
         { name: '產生管理看板', description: '產生會自動更新的【真實名單】班表 (管理員)' },
         { name: '迴響管理區', description: '將此頻道加入或移除「迴響管理區」(多頻道同步接收派單/審核/結案)' },
@@ -265,9 +263,8 @@ client.once('ready', async () => {
                     continue;
                 }
 
-                // 僅針對已審核通過的訂單處理鬧鐘與結案
                 if (data.status === 'approved') {
-                    // 【鬧鐘派單】
+                    // 【階段二：鬧鐘派單】
                     if (!data.reminded && timeDiff <= alarmLeadTime * 60 * 1000 && timeDiff > 0) {
                         try {
                             let finalPriceStr = `${prices[data.location] || '未設定'}萬`;
@@ -300,20 +297,48 @@ client.once('ready', async () => {
                         } catch (error) { console.log('發送鬧鐘失敗'); }
                     }
 
-                    // 【結案確認】
+                    // 【階段三：結案確認】(專屬私訊按鈕技術)
                     if (!data.postChecked && now - data.timestamp >= 10 * 60 * 1000) {
                         try {
                             const postCheckEmbed = new EmbedBuilder()
                                 .setColor(0x8A2BE2)
                                 .setTitle('⏱️ 訂單結案確認 (已過預約時間10分鐘)')
-                                .setDescription(`**玩家**：<@${data.discordId}>\n**地點**：${data.location}\n**頻道**：${displayChannel}\n**預約時間**：\`${data.date} ${data.time}\`\n**接單專員**：${data.takenBy ? `<@${data.takenBy}>` : '無人接單'}\n\n*這筆訂單已經結束，請問順利完成了嗎？*`);
+                                .setDescription(`**玩家**：<@${data.discordId}>\n**地點**：${data.location}\n**頻道**：${displayChannel}\n**預約時間**：\`${data.date} ${data.time}\`\n\n*這筆訂單已經結束，請問順利完成了嗎？*`);
 
                             const row = new ActionRowBuilder().addComponents(
                                 new ButtonBuilder().setCustomId(`complete_${data.id}`).setLabel('⭕ 順利完成').setStyle(ButtonStyle.Success),
                                 new ButtonBuilder().setCustomId(`fail_${data.id}`).setLabel('❌ 未完成/取消').setStyle(ButtonStyle.Danger)
                             );
 
-                            const sentMsgs = await broadcastToManagementAreas({ embeds: [postCheckEmbed], components: [row] });
+                            let sentMsgs = [];
+                            
+                            // 如果有人接單，把按鈕偷偷私訊給他
+                            if (data.takenBy) {
+                                let dmSent = false;
+                                const adminUser = await client.users.fetch(data.takenBy).catch(() => null);
+                                if (adminUser) {
+                                    try {
+                                        await adminUser.send({ embeds: [postCheckEmbed], components: [row] });
+                                        dmSent = true;
+                                    } catch (e) {}
+                                }
+
+                                if (dmSent) {
+                                    // 頻道內只發純文字狀態，沒有按鈕
+                                    const logEmbed = new EmbedBuilder().setColor(0x8A2BE2).setTitle('⏱️ 等待專員結案回報')
+                                        .setDescription(`**玩家**：<@${data.discordId}>\n**地點**：${data.location}\n**預約時間**：\`${data.date} ${data.time}\`\n\n系統已私訊通知接單專員 <@${data.takenBy}> 進行結案確認。`);
+                                    sentMsgs = await broadcastToManagementAreas({ embeds: [logEmbed], components: [] });
+                                } else {
+                                    // 防呆：如果專員關閉私訊，只好發到頻道Tag他
+                                    postCheckEmbed.setDescription(`**玩家**：<@${data.discordId}>\n**地點**：${data.location}\n**預約時間**：\`${data.date} ${data.time}\`\n\n⚠️ **無法私訊專員**，請 <@${data.takenBy}> 點擊下方按鈕結案：`);
+                                    sentMsgs = await broadcastToManagementAreas({ content: `<@${data.takenBy}>`, embeds: [postCheckEmbed], components: [row] });
+                                }
+                            } else {
+                                // 完全沒人接單的狀況，發給大家搶救
+                                postCheckEmbed.setDescription(`**玩家**：<@${data.discordId}>\n**地點**：${data.location}\n**預約時間**：\`${data.date} ${data.time}\`\n\n⚠️ **此單無人接單**，請問有專員幫忙完成了嗎？`);
+                                sentMsgs = await broadcastToManagementAreas({ embeds: [postCheckEmbed], components: [row] });
+                            }
+                            
                             await db.collection('reservations').doc(data.id).update({ postChecked: true, checkMsgs: sentMsgs });
                         } catch (error) { console.log('發送結案確認失敗'); }
                     }
@@ -408,6 +433,38 @@ client.on('interactionCreate', async interaction => {
                 { name: '帳號排單狀態', value: banStatus, inline: false }
             );
         await interaction.editReply({ embeds: [statEmbed] });
+    }
+    else if (interaction.isChatInputCommand() && interaction.commandName === '接單統計') {
+        if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.reply({ content: '❌ 權限不足', ephemeral: true });
+        await interaction.deferReply({ ephemeral: true });
+        
+        const allResSnapshot = await db.collection('reservations').get();
+        const tw = getTaiwanTime();
+        const currentMonthPrefix = `${tw.yyyy}-${tw.mm}`;
+        
+        const stats = {};
+        allResSnapshot.forEach(doc => {
+            const r = doc.data();
+            if (r.takenBy && (r.status === 'completed' || r.status === 'failed')) {
+                if (!stats[r.takenBy]) stats[r.takenBy] = { total: 0, month: 0, failed: 0 };
+                if (r.status === 'completed') {
+                    stats[r.takenBy].total += 1;
+                    if (r.date.startsWith(currentMonthPrefix)) stats[r.takenBy].month += 1;
+                } else if (r.status === 'failed') {
+                    stats[r.takenBy].failed += 1;
+                }
+            }
+        });
+        
+        if (Object.keys(stats).length === 0) return interaction.editReply({ content: '目前還沒有任何專員的結案紀錄喔！' });
+        
+        let desc = '';
+        for (const [userId, s] of Object.entries(stats)) {
+            desc += `**專員**：<@${userId}>\n> 本月完成：\`${s.month}\` 次\n> 歷史總完成：\`${s.total}\` 次\n> 失敗/取消數：\`${s.failed}\` 次\n\n`;
+        }
+        
+        const embed = new EmbedBuilder().setColor(0x00FF00).setTitle('📊 迴響專員接單績效統計').setDescription(desc).setTimestamp();
+        await interaction.editReply({ embeds: [embed] });
     }
 
     // =====================================
@@ -553,20 +610,38 @@ client.on('interactionCreate', async interaction => {
             return;
         }
 
-        // 【結案 O/X 按鈕】
+        // 【結案 O/X 按鈕】(全新鎖定與同步邏輯)
         if (action === 'complete' || action === 'fail') {
             if (data.status === 'completed' || data.status === 'failed') return interaction.reply({ content: '❌ 訂單已經結案過了！', ephemeral: true });
-            const originalEmbed = EmbedBuilder.from(interaction.message.embeds[0]);
             
-            if (action === 'complete') {
-                await docRef.update({ status: 'completed' });
-                originalEmbed.setColor(0x00FF00).setTitle('✅ 訂單已結案 (⭕ 順利完成)').addFields({ name: '確認人', value: `<@${interaction.user.id}>` });
-            } else {
-                await docRef.update({ status: 'failed' });
-                originalEmbed.setColor(0xFF0000).setTitle('❌ 訂單已結案 (❌ 未完成/取消)').addFields({ name: '確認人', value: `<@${interaction.user.id}>` });
+            if (data.takenBy && data.takenBy !== interaction.user.id) {
+                return interaction.reply({ content: `❌ 只有接單的專員 <@${data.takenBy}> 才能進行結案確認喔！`, ephemeral: true });
             }
+
+            const finalTakenBy = data.takenBy || interaction.user.id;
+            const originalEmbed = EmbedBuilder.from(interaction.message.embeds[0]);
+            const isComplete = action === 'complete';
+            
+            await docRef.update({ 
+                status: isComplete ? 'completed' : 'failed', 
+                takenBy: finalTakenBy 
+            });
+
+            originalEmbed.setColor(isComplete ? 0x00FF00 : 0xFF0000)
+                .setTitle(isComplete ? '✅ 訂單已結案 (⭕ 順利完成)' : '❌ 訂單已結案 (❌ 未完成/取消)')
+                .setDescription(`**玩家**：<@${data.discordId}>\n**地點**：${data.location}\n**預約時間**：\`${data.date} ${data.time}\``);
+                
+            originalEmbed.setFields([]);
+            originalEmbed.addFields({ name: '確認結案專員', value: `<@${finalTakenBy}>` });
+
             await interaction.update({ embeds: [originalEmbed], components: [] });
-            await syncManagementMessages(data.checkMsgs, originalEmbed, []);
+
+            // 同步更新管理區的文字與狀態 (如果你是在 DM 裡按的，也會同步到頻道)
+            const logEmbed = new EmbedBuilder().setColor(isComplete ? 0x00FF00 : 0xFF0000)
+                .setTitle(isComplete ? '✅ 訂單已結案 (⭕ 順利完成)' : '❌ 訂單已結案 (❌ 未完成/取消)')
+                .setDescription(`**玩家**：<@${data.discordId}>\n**地點**：${data.location}\n**預約時間**：\`${data.date} ${data.time}\`\n**結案專員**：<@${finalTakenBy}>`);
+            await syncManagementMessages(data.checkMsgs, logEmbed, []);
+
             updateBoard();
             return;
         }
@@ -594,7 +669,7 @@ client.on('interactionCreate', async interaction => {
                 const { points, bannedUntil } = await addViolation(interaction.user.id);
                 if (bannedUntil) replyText += `\n💡 **系統通知**：因近期臨時調整達上限，暫停預約權限 7 天。`;
                 else replyText += `\n💡 **溫馨小提醒**：距離開打不到 30 分鐘取消，已記錄一次臨時調整（目前：${points}/3）。`;
-                await broadcastToManagementAreas({ content: `📢 **【臨時釋出候補】**\n原本預約的【${data.location}】\`${data.date} ${data.time}\` 釋出了，欲接手請重新登記！` });
+                await broadcastToManagementAreas({ content: `📢 **【臨時釋出候補】**\n原本預約的【${data.location}】\`${data.date} ${data.time}\` 釋出了，欲接手請重新預約！` });
             }
             await interaction.update({ embeds: [cancelEmbed], components: [] });
             await interaction.followUp({ content: replyText, ephemeral: true });
@@ -618,7 +693,6 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
-    // 處理：修改表單送出 (重新轉入待審核)
     else if (interaction.isModalSubmit() && interaction.customId.startsWith('submitEdit_')) {
         const docId = interaction.customId.split('_')[1];
         const newDate = interaction.fields.getTextInputValue('newDate').replace(/\//g, '-');
@@ -655,7 +729,6 @@ client.on('interactionCreate', async interaction => {
             else replyText += `\n💡 **溫馨小提醒**：距離原本開打不到 30 分鐘更改時間，已記錄一次臨時調整（目前：${points}/3）。`;
         }
 
-        // 標記舊的審核訊息為「已修改」
         if (data.reviewMsgs) {
             const oldAdminEmbed = new EmbedBuilder().setColor(0x808080).setTitle('📝 玩家已修改資料，重新提交審核中')
                 .setDescription(`**玩家**：<@${data.discordId}>\n**原時間**：\`${data.date} ${data.time}\``);
