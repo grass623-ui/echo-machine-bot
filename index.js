@@ -181,19 +181,18 @@ client.once('ready', async () => {
                 if (timeDiff <= 15 * 60 * 1000 && timeDiff > 0) {
                     try {
                         const price = prices[data.location] || '未設定';
-                        const user = await client.users.fetch(data.discordId);
-                        const dcName = user.globalName || user.username;
                         
+                        const user = await client.users.fetch(data.discordId);
                         await user.send(`🔔 **王團預約提醒鬧鐘**\n您預約的【${data.location}】將在 15 分鐘後（\`${data.date} ${data.time}\`）開始，請備妥 ${price}萬 楓幣給迴響機！`).catch(console.error);
                         
                         if (echoAdminId) {
-                            // 時區修正：精準減去 5 分鐘，並加上台灣時區補償 (+8 小時)
                             const pre5MinTime = data.timestamp - 5 * 60 * 1000;
                             const twPre5Obj = new Date(pre5MinTime + 8 * 60 * 60 * 1000);
                             const pre5MinStr = String(twPre5Obj.getUTCHours()).padStart(2, '0') + ':' + String(twPre5Obj.getUTCMinutes()).padStart(2, '0');
                             
                             const echoUser = await client.users.fetch(echoAdminId);
-                            await echoUser.send(`🔔 **王團提醒訂單鬧鐘**\n${dcName}與您預約的【${data.location}】將在 15 分鐘後（\`${data.date} ${data.time}\`）需要施放迴響！\n請記得於（\`${data.date} ${pre5MinStr}\`）上線並準備施放 **英雄的迴響** 喔！`).catch(console.error);
+                            // 在這裡直接使用 <@ID> 來標記該玩家
+                            await echoUser.send(`🔔 **王團提醒訂單鬧鐘**\n<@${data.discordId}> 與您預約的【${data.location}】將在 15 分鐘後（\`${data.date} ${data.time}\`）需要施放迴響！\n請記得於（\`${data.date} ${pre5MinStr}\`）上線並準備施放 **英雄的迴響** 喔！`).catch(console.error);
                         }
                         await db.collection('reservations').doc(doc.id).update({ reminded: true });
                     } catch (error) { console.log('私訊失敗'); }
@@ -205,7 +204,7 @@ client.once('ready', async () => {
 
 client.on('interactionCreate', async interaction => {
     
-    // 指令處理：註冊、看板、價格...
+    // 指令處理：註冊、看板、價格
     if (interaction.isChatInputCommand() && interaction.commandName === '註冊迴響機') {
         if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.reply({ content: '❌ 權限不足', ephemeral: true });
         await db.collection('settings').doc('echoAdmin').set({ discordId: interaction.user.id });
@@ -260,6 +259,9 @@ client.on('interactionCreate', async interaction => {
         const newDateTime = new Date(`${date}T${time}:00+08:00`);
 
         if (isNaN(newDateTime.getTime())) return interaction.reply({ content: '❌ **日期或時間格式錯誤**。', ephemeral: true });
+        
+        // 防呆設計：禁止預約過去的時間
+        if (newDateTime.getTime() <= Date.now()) return interaction.reply({ content: '❌ **無法預約過去的時間**，請設定未來的時刻。', ephemeral: true });
 
         const snapshot = await db.collection('reservations').get();
         let reservations = [];
@@ -276,15 +278,17 @@ client.on('interactionCreate', async interaction => {
             timestamp: newDateTime.getTime(), reminded: false
         });
         
+        // 按鈕順序：更改時間 / 取消預約 / 頻道設定
         const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`cancel_${docRef.id}`).setLabel('🗑️ 取消預約').setStyle(ButtonStyle.Danger),
             new ButtonBuilder().setCustomId(`updTime_${docRef.id}`).setLabel('⌚ 更改時間').setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId(`updChan_${docRef.id}`).setLabel('✏️ 補填/更改頻道').setStyle(ButtonStyle.Primary)
+            new ButtonBuilder().setCustomId(`cancel_${docRef.id}`).setLabel('🗑️ 取消預約').setStyle(ButtonStyle.Danger),
+            new ButtonBuilder().setCustomId(`updChan_${docRef.id}`).setLabel('✏️ 頻道設定').setStyle(ButtonStyle.Primary)
         );
 
+        // 精簡版卡片文字
         const embed = new EmbedBuilder()
             .setColor(0x00FF00).setTitle('✅ 預約已送出')
-            .setDescription(`**地點**：${location}\n**時間**：${date} ${time}\n**頻道**：${channel || '未填寫 (當日決定)'}\n\n*您可以點擊下方按鈕隨時管理這筆訂單，若取消或更改訂單將會同步更新伺服器班表。*`);
+            .setDescription(`**地點**：${location}\n**時間**：${date} ${time}\n**頻道**：${channel || '未填寫 (當日決定)'}`);
 
         try {
             await interaction.user.send({ embeds: [embed], components: [row] });
@@ -300,21 +304,33 @@ client.on('interactionCreate', async interaction => {
     else if (interaction.isButton()) {
         const [action, docId] = interaction.customId.split('_');
         
+        const doc = await db.collection('reservations').doc(docId).get();
+        if (!doc.exists) return interaction.reply({ content: '❌ 找不到此訂單，可能已被刪除。', ephemeral: true });
+        
+        const data = doc.data();
+
+        // 檢查訂單是否已過期 (自動轉化為歷史紀錄)
+        if (data.timestamp < Date.now()) {
+            const expiredEmbed = new EmbedBuilder()
+                .setColor(0x808080)
+                .setTitle('📜 歷史預約紀錄')
+                .setDescription(`**地點**：${data.location}\n**時間**：${data.date} ${data.time}\n**頻道**：${data.channel || '未填寫 (當日決定)'}\n\n*此預約時間已過，無法再進行更改。*`);
+            
+            // 將卡片更新為歷史紀錄，並清空所有按鈕
+            return interaction.update({ embeds: [expiredEmbed], components: [] });
+        }
+        
         if (action === 'cancel') {
             await db.collection('reservations').doc(docId).delete();
             await interaction.update({ content: '✅ **這筆訂單已成功取消**，伺服器排班表已同步刷新。', embeds: [], components: [] });
             updateBoard();
         } 
         else if (action === 'updChan') {
-            const modal = new ModalBuilder().setCustomId(`submitChan_${docId}`).setTitle('補填 / 更改頻道');
-            modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('newChannel').setLabel("新頻道").setStyle(TextInputStyle.Short).setRequired(true)));
+            const modal = new ModalBuilder().setCustomId(`submitChan_${docId}`).setTitle('頻道設定');
+            modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('newChannel').setLabel("新頻道").setStyle(TextInputStyle.Short).setValue(data.channel || '').setRequired(true)));
             await interaction.showModal(modal);
         }
         else if (action === 'updTime') {
-            const doc = await db.collection('reservations').doc(docId).get();
-            if (!doc.exists) return interaction.reply({ content: '❌ 找不到此訂單，可能已被刪除。', ephemeral: true });
-            
-            const data = doc.data();
             const modal = new ModalBuilder().setCustomId(`submitTime_${docId}`).setTitle('更改預約時間');
             modal.addComponents(
                 new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('newDate').setLabel("新日期 (例如：2026-08-11)").setStyle(TextInputStyle.Short).setValue(data.date).setRequired(true)),
@@ -331,6 +347,15 @@ client.on('interactionCreate', async interaction => {
         
         await db.collection('reservations').doc(docId).update({ channel: newChannel });
         await interaction.reply({ content: `✅ 頻道已成功更新為：**${newChannel}**，看板已同步刷新。`, ephemeral: true });
+        
+        // 更新 DM 內的卡片文字
+        const updatedDoc = await db.collection('reservations').doc(docId).get();
+        const data = updatedDoc.data();
+        const embed = new EmbedBuilder()
+            .setColor(0x00FF00).setTitle('✅ 預約已送出')
+            .setDescription(`**地點**：${data.location}\n**時間**：${data.date} ${data.time}\n**頻道**：${newChannel}`);
+        await interaction.message.edit({ embeds: [embed] });
+
         updateBoard();
     }
 
@@ -344,8 +369,8 @@ client.on('interactionCreate', async interaction => {
         const newDateTime = new Date(`${newDate}T${newTime}:00+08:00`);
 
         if (isNaN(newDateTime.getTime())) return interaction.reply({ content: '❌ **日期或時間格式錯誤**。', ephemeral: true });
+        if (newDateTime.getTime() <= Date.now()) return interaction.reply({ content: '❌ **無法更改為過去的時間**，請設定未來的時刻。', ephemeral: true });
 
-        // 重新進行防撞檢查 (需排除自己原本的單子)
         const currentDoc = await db.collection('reservations').doc(docId).get();
         if (!currentDoc.exists) return interaction.reply({ content: '❌ 找不到此訂單。', ephemeral: true });
         const currentLocation = currentDoc.data().location;
@@ -362,7 +387,6 @@ client.on('interactionCreate', async interaction => {
 
         if (isConflict) return interaction.reply({ content: '❌ 您申請更改的時間前後10分鐘有訂單，無法進行更改，請重新設定。', ephemeral: true });
 
-        // 更新資料庫，並將提醒狀態歸零 (以防改時間後沒提醒到)
         await db.collection('reservations').doc(docId).update({ 
             date: newDate, 
             time: newTime, 
@@ -370,6 +394,14 @@ client.on('interactionCreate', async interaction => {
             reminded: false 
         });
         await interaction.reply({ content: `✅ 預約時間已成功更改為：**${newDate} ${newTime}**，看板已同步刷新。`, ephemeral: true });
+
+        // 更新 DM 內的卡片文字
+        const data = currentDoc.data();
+        const embed = new EmbedBuilder()
+            .setColor(0x00FF00).setTitle('✅ 預約已送出')
+            .setDescription(`**地點**：${currentLocation}\n**時間**：${newDate} ${newTime}\n**頻道**：${data.channel || '未填寫 (當日決定)'}`);
+        await interaction.message.edit({ embeds: [embed] });
+
         updateBoard();
     }
 });
