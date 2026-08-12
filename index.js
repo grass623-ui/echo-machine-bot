@@ -51,6 +51,11 @@ function getTaiwanTime() {
     };
 }
 
+function getBoardContentWithTime() {
+    const tw = getTaiwanTime();
+    return `${publicBoardIntro}\n\n🔄 **最後刷新時間**：\`${tw.yyyy}-${tw.mm}-${tw.dd} ${tw.hh}:${tw.min}\``;
+}
+
 async function addViolation(discordId) {
     const userRef = db.collection('users').doc(discordId);
     const doc = await userRef.get();
@@ -81,7 +86,7 @@ async function broadcastToManagementAreas(payload) {
     return sentMsgs;
 }
 
-// 原地更新工單
+// 原地更新工單 (靜態變更，不移動位置)
 async function syncManagementMessages(msgRefs, newEmbed, newComponents = []) {
     if (!msgRefs || !Array.isArray(msgRefs)) return;
     for (const m of msgRefs) {
@@ -95,7 +100,7 @@ async function syncManagementMessages(msgRefs, newEmbed, newComponents = []) {
     }
 }
 
-// 動態推移工單
+// 動態推移工單 (刪除舊卡片，發送新卡片到最下面)
 async function bumpManagementMessages(msgRefs, newEmbed, newComponents = []) {
     if (!msgRefs || !Array.isArray(msgRefs)) return [];
     let newRefs = [];
@@ -104,8 +109,8 @@ async function bumpManagementMessages(msgRefs, newEmbed, newComponents = []) {
             const ch = await client.channels.fetch(m.channelId).catch(() => null);
             if (ch) {
                 const oldMsg = await ch.messages.fetch(m.messageId).catch(() => null);
-                if (oldMsg) await oldMsg.delete().catch(() => null); 
-                const newMsg = await ch.send({ embeds: [newEmbed], components: newComponents }); 
+                if (oldMsg) await oldMsg.delete().catch(() => null); // 刪除舊訊息
+                const newMsg = await ch.send({ embeds: [newEmbed], components: newComponents }); // 發送至最下層
                 newRefs.push({ channelId: ch.id, messageId: newMsg.id });
             }
         } catch (e) {}
@@ -202,7 +207,6 @@ function buildTicketPayload(docId, data) {
     return { embeds: [embed], components };
 }
 
-// 產生公開與管理看板 (全新整合式排版)
 function generateScheduleEmbed(reservations, isAdmin = false) {
     const now = Date.now();
     const tw = getTaiwanTime();
@@ -252,7 +256,6 @@ function generateScheduleEmbed(reservations, isAdmin = false) {
         }
     }
 
-    // 將刷新時間包裝在 Embed 最底端
     scheduleText += `🔄 **最後刷新時間**：\`${tw.yyyy}-${tw.mm}-${tw.dd} ${tw.hh}:${tw.min}\``;
 
     return new EmbedBuilder()
@@ -261,12 +264,13 @@ function generateScheduleEmbed(reservations, isAdmin = false) {
         .setDescription(scheduleText);
 }
 
-// 自動更新看板
 async function updateBoard() {
     try {
         const snapshot = await db.collection('reservations').get();
         let reservations = [];
         snapshot.forEach(doc => reservations.push({ id: doc.id, ...doc.data() }));
+
+        const boardContent = getBoardContentWithTime();
 
         const pubRef = db.collection('settings').doc('publicBoards');
         const pubDoc = await pubRef.get();
@@ -338,6 +342,7 @@ client.once('ready', async () => {
     ];
     await client.application.commands.set(commands);
 
+    // 核心排程：巡邏時間線並觸發推進 (Bumping)
     setInterval(async () => {
         const now = Date.now();
         
@@ -357,7 +362,9 @@ client.once('ready', async () => {
                 const timeDiff = data.timestamp - now;
                 let needsSync = false;
                 let needsBump = false;
+                const displayChannel = data.channel ? data.channel : '-'; 
 
+                // 1. 過期清理
                 if (data.status === 'pending' && data.timestamp < now) {
                     data.status = 'expired';
                     await db.collection('reservations').doc(data.id).update({ status: 'expired' });
@@ -365,6 +372,7 @@ client.once('ready', async () => {
                     await editUserDM(data.discordId, data.userDmMsgId, { embeds: [new EmbedBuilder().setColor(0x808080).setTitle('⏳ 預約已過期失效').setDescription(`您的預約因超過開打時間未審核，已自動失效。\n**地點**：${data.location}\n**時間**：${data.date} ${data.time}`)], components: [] });
                 }
 
+                // 2. 鬧鐘階段 (推移置底)
                 if (data.status === 'approved' && !data.reminded && timeDiff <= alarmLeadTime * 60 * 1000 && timeDiff > 0) {
                     data.reminded = true;
                     await db.collection('reservations').doc(data.id).update({ reminded: true });
@@ -380,15 +388,30 @@ client.once('ready', async () => {
                             if ((orderIndex % cycle) >= rule.buy) finalPriceStr = `0萬 (💎 VIP滿件優惠)`;
                         }
                     }
+
+                    const pre5MinTime = data.timestamp - 5 * 60 * 1000;
+                    const twPre5Obj = new Date(pre5MinTime + 8 * 60 * 60 * 1000);
+                    const pre5MinStr = String(twPre5Obj.getUTCHours()).padStart(2, '0') + ':' + String(twPre5Obj.getUTCMinutes()).padStart(2, '0');
+
+                    // 🎯 發給「客戶」的私訊鬧鐘
                     try {
                         const user = await client.users.fetch(data.discordId);
-                        const pre5MinTime = data.timestamp - 5 * 60 * 1000;
-                        const twPre5Obj = new Date(pre5MinTime + 8 * 60 * 60 * 1000);
-                        const pre5MinStr = String(twPre5Obj.getUTCHours()).padStart(2, '0') + ':' + String(twPre5Obj.getUTCMinutes()).padStart(2, '0');
-                        await user.send(`🔔 **王團預約提醒鬧鐘**\n<@${data.discordId}> 與您預約的【${data.location}】將在 ${alarmLeadTime} 分鐘後（\`${data.date} ${data.time}\`）於 \`${data.channel || '-'}\` 頻道施放迴響！\n請記得於（\`${data.date} ${pre5MinStr}\`）上線並準備施放 **英雄的迴響** 喔！\n*(請備妥 ${finalPriceStr} 楓幣給專員)*`);
+                        await user.send(`🔔 **王團預約提醒鬧鐘**\n您預約的【${data.location}】將在 ${alarmLeadTime} 分鐘後（\`${data.date} ${data.time}\`）於 \`${displayChannel}\` 頻道施放迴響！\n*(請備妥 ${finalPriceStr} 楓幣給迴響機)*`);
                     } catch (e) {}
+
+                    // 🎯 發給「管理員/接單專員」的鬧鐘
+                    if (data.takenBy) {
+                        try {
+                            const adminUser = await client.users.fetch(data.takenBy);
+                            await adminUser.send(`🔔 **王團預約提醒鬧鐘**\n<@${data.discordId}> 與您預約的【${data.location}】須於 ${alarmLeadTime} 分鐘後（\`${data.date} ${data.time}\`）於 \`${displayChannel}\` 頻道施放迴響！\n請記得於（\`${data.date} ${pre5MinStr}\`）上線並準備施放 **英雄的迴響** 喔！`);
+                        } catch (e) {}
+                    } else {
+                        // 若無人接單，直接在管理區 tag 廣播
+                        await broadcastToManagementAreas({ content: `🚨 **【緊急派單通知】**\n<@${data.discordId}> 預約的【${data.location}】將在 ${alarmLeadTime} 分鐘後出團，目前**尚未有專員接單**！\n請盡速點擊下方卡片的「✋ 我來接單」！` });
+                    }
                 }
 
+                // 3. 結案階段 (推移置底)
                 if (data.status === 'approved' && data.reminded && !data.postChecked && now - data.timestamp >= 10 * 60 * 1000) {
                     data.postChecked = true;
                     let dmFailed = false;
@@ -400,7 +423,7 @@ client.once('ready', async () => {
                                 new ButtonBuilder().setCustomId(`complete_${data.id}`).setLabel('⭕ 順利完成').setStyle(ButtonStyle.Success),
                                 new ButtonBuilder().setCustomId(`fail_${data.id}`).setLabel('❌ 未完成/取消').setStyle(ButtonStyle.Danger)
                             );
-                            await adminUser.send({ embeds: [new EmbedBuilder().setColor(0x8A2BE2).setTitle('⏱️ 訂單結案確認').setDescription(`**玩家**：<@${data.discordId}>\n**地點**：${data.location}\n**頻道**：${data.channel || '-'}\n**預約時間**：\`${data.date} ${data.time}\`\n\n*請問順利完成了嗎？*`)], components: [row] });
+                            await adminUser.send({ embeds: [new EmbedBuilder().setColor(0x8A2BE2).setTitle('⏱️ 訂單結案確認').setDescription(`**玩家**：<@${data.discordId}>\n**地點**：${data.location}\n**頻道**：${displayChannel}\n**預約時間**：\`${data.date} ${data.time}\`\n\n*請問順利完成了嗎？*`)], components: [row] });
                         } catch (e) { dmFailed = true; }
                     }
                     data.dmFailed = dmFailed;
@@ -408,6 +431,7 @@ client.once('ready', async () => {
                     needsBump = true;
                 }
 
+                // 4. 強制逾期結算
                 if (data.status === 'approved' && data.postChecked && now - data.timestamp >= 12 * 60 * 60 * 1000) {
                     data.status = 'failed';
                     data.closer = '系統自動結案';
@@ -415,6 +439,7 @@ client.once('ready', async () => {
                     needsSync = true;
                 }
 
+                // 根據狀態選擇更新方式
                 if (needsBump) {
                     const payload = buildTicketPayload(data.id, data);
                     const newRefs = await bumpManagementMessages(data.ticketMsgs, payload.embeds[0], payload.components);
@@ -475,7 +500,7 @@ client.on('interactionCreate', async interaction => {
                 await docRef.set({ list });
                 return interaction.editReply({ content: '✅ 已移除公開看板維護。' });
             } else {
-                const msg = await interaction.channel.send({ content: publicBoardIntro, embeds: [new EmbedBuilder().setTitle('載入中...').setColor(0x0099FF)], components: [reserveBtnRow] });
+                const msg = await interaction.channel.send({ content: getBoardContentWithTime(), embeds: [new EmbedBuilder().setTitle('載入中...').setColor(0x0099FF)], components: [reserveBtnRow] });
                 list.push({ channelId: interaction.channelId, messageId: msg.id });
                 await docRef.set({ list });
                 await interaction.editReply({ content: '✅ 公開看板設定成功！' });
@@ -493,7 +518,8 @@ client.on('interactionCreate', async interaction => {
                 await docRef.set({ list });
                 return interaction.editReply({ content: '✅ 已移除真實名單看板。' });
             } else {
-                const msg = await interaction.channel.send({ embeds: [new EmbedBuilder().setTitle('載入中...').setColor(0xFF0000)] });
+                const tw = getTaiwanTime();
+                const msg = await interaction.channel.send({ content: `🔄 **最後刷新時間**：\`${tw.yyyy}-${tw.mm}-${tw.dd} ${tw.hh}:${tw.min}\``, embeds: [new EmbedBuilder().setTitle('載入中...').setColor(0xFF0000)] });
                 list.push({ channelId: interaction.channelId, messageId: msg.id });
                 await docRef.set({ list });
                 await interaction.editReply({ content: '✅ 管理看板設定成功！' });
@@ -634,7 +660,7 @@ client.on('interactionCreate', async interaction => {
             await docRef.update({ userDmMsgId: dmMsg.id });
             await interaction.editReply({ content: `✅ 預約已送出！請查看 DM 等待審核結果。` });
         } catch (error) {
-            await interaction.editReply({ content: `✅ 預約已送出，正在等待審核。\n⚠️ **請開啟接收私訊功能！**` });
+            await interaction.editReply({ content: `✅ 預約已送出，正在等待管理員審核。\n⚠️ **請開啟接收私訊功能！**` });
         }
     }
 
