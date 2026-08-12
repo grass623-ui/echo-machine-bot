@@ -66,8 +66,7 @@ function getTaiwanTime() {
 }
 
 function getBoardContentWithTime() {
-    const tw = getTaiwanTime();
-    return `${publicBoardIntro}\n\n🔄 **最後刷新時間**：\`${tw.yyyy}-${tw.mm}-${tw.dd} ${tw.hh}:${tw.min}\``;
+    return publicBoardIntro; // 拿掉文字版的時間，只保留 Embed 內部的時間
 }
 
 async function addViolation(discordId) {
@@ -167,20 +166,20 @@ function buildTicketPayload(docId, data) {
         timeline += `> ✅ 審核通過 (審核：<@${data.reviewer || '管理員'}>)\n`;
 
         if (data.status === 'approved') {
-            if (!data.reminded) {
-                embed.setColor(0x00FF00).setTitle('🟢 訂單已排程');
-                timeline += `> ⏳ 等待鬧鐘發送...\n`;
-            } else if (data.reminded && !data.postChecked) {
+            if (!data.postChecked) {
                 if (!data.takenBy) {
-                    embed.setColor(0xFFA500).setTitle('🚨 準備出團 (等待接單)');
-                    timeline += `> 🟡 鬧鐘已響，等待專員接單...\n`;
+                    // 尚未有人接單：無論是否發過鬧鐘，都顯示「等待接單」並給予按鈕
+                    embed.setColor(data.reminded ? 0xFFA500 : 0x00FF00).setTitle(data.reminded ? '🚨 準備出團 (等待接單)' : '🟢 訂單已排程 (等待接單)');
+                    timeline += data.reminded ? `> 🟡 鬧鐘已響，等待專員接單...\n` : `> ⏳ 等待專員接單...\n`;
                     row.addComponents(new ButtonBuilder().setCustomId(`takeOrder_${docId}`).setLabel('✋ 我來接單').setStyle(ButtonStyle.Primary));
                 } else {
+                    // 已有人接單：顯示負責的專員
                     embed.setColor(0x00FF00).setTitle('🟢 專員已接單');
                     timeline += `> ✅ 專員接單 (專員：<@${data.takenBy}>)\n`;
-                    timeline += `> ⏳ 等待出團與結案...\n`;
+                    timeline += data.reminded ? `> ⏳ 等待出團與結案...\n` : `> ⏳ 等待鬧鐘發送...\n`;
                 }
-            } else if (data.postChecked) {
+            } else {
+                // 等待結案狀態 (10分鐘後)
                 embed.setColor(0x8A2BE2).setTitle('🟣 等待結案回報');
                 if (data.takenBy) {
                     timeline += `> ✅ 專員接單 (專員：<@${data.takenBy}>)\n`;
@@ -737,6 +736,11 @@ client.on('interactionCreate', async interaction => {
                 
                 const payload = buildTicketPayload(docId, data);
                 await syncManagementMessages(data.ticketMsgs, payload.embeds[0], payload.components);
+                
+                // 👇 新增：如果是從「緊急派單」點擊進來的，就順手把這則洗版的派單訊息刪除
+                if (interaction.message && interaction.message.content && interaction.message.content.includes('【緊急派單通知】')) {
+                    await interaction.message.delete().catch(() => {});
+                }
                 
                 // 私訊通知接單專員
                 try {
