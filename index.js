@@ -399,11 +399,17 @@ client.once('ready', async () => {
                             await adminUser.send(`🔔 **王團預約提醒鬧鐘**\n<@${data.discordId}> 與您預約的【${data.location}】須於 ${alarmLeadTime} 分鐘後（\`${data.date} ${data.time}\`）於 \`${displayChannel}\` 頻道施放迴響！\n請記得於（\`${data.date} ${pre5MinStr}\`）上線並準備施放 **英雄的迴響** 喔！`);
                         } catch (e) {}
                     } else {
-                        await broadcastToManagementAreas({ content: `🚨 **【緊急派單通知】**\n<@${data.discordId}> 預約的【${data.location}】將在 ${alarmLeadTime} 分鐘後出團，目前**尚未有專員接單**！\n請盡速點擊下方卡片的「✋ 我來接單」！` });
+                        const urgentRow = new ActionRowBuilder().addComponents(
+                            new ButtonBuilder().setCustomId(`takeOrder_${data.id}`).setLabel('✋ 我來接單').setStyle(ButtonStyle.Primary)
+                        );
+                        await broadcastToManagementAreas({ 
+                            content: `🚨 **【緊急派單通知】**\n<@${data.discordId}> 預約的【${data.location}】將在 ${alarmLeadTime} 分鐘後出團，目前**尚未有專員接單**！\n請盡速點擊下方的「✋ 我來接單」！`,
+                            components: [urgentRow]
+                        });
                     }
                 }
 
-                // 3. 自動移除玩家 DM 的變更按鈕
+                // 3. 自動移除玩家私訊的變更按鈕
                 if (data.status === 'approved' && !data.buttonsRemoved && now >= data.timestamp) {
                     await editUserDM(data.discordId, data.userDmMsgId, { components: [] });
                     await db.collection('reservations').doc(data.id).update({ buttonsRemoved: true });
@@ -662,9 +668,9 @@ client.on('interactionCreate', async interaction => {
             try {
                 const dmMsg = await interaction.user.send({ embeds: [dmEmbed], components: [cancelRow] });
                 await docRef.update({ userDmMsgId: dmMsg.id });
-                await interaction.editReply({ content: `✅ 預約已送出！請查看 DM 等待審核結果。` });
+                await interaction.editReply({ content: `✅ 預約已送出！請留意您的**私訊**以等待審核結果。` });
             } catch (error) {
-                await interaction.editReply({ content: `✅ 預約已送出，正在等待管理員審核。\n⚠️ **請開啟接收私訊功能！**` });
+                await interaction.editReply({ content: `✅ 預約已送出，正在等待管理員審核。\n⚠️ **請開啟接收私訊功能，以便接收後續通知！**` });
             }
         }
 
@@ -731,6 +737,15 @@ client.on('interactionCreate', async interaction => {
                 
                 const payload = buildTicketPayload(docId, data);
                 await syncManagementMessages(data.ticketMsgs, payload.embeds[0], payload.components);
+                
+                // 私訊通知接單專員
+                try {
+                    const adminUser = await client.users.fetch(interaction.user.id);
+                    await adminUser.send(`✅ **接單成功通知**\n您已成功接取玩家 <@${data.discordId}> 的預約單！\n**地點**：${data.location}\n**時間**：\`${data.date} ${data.time}\`\n請記得準時上線施放迴響喔！`);
+                    await interaction.followUp({ content: '✅ 接單成功！已發送詳細資訊至您的私訊。', ephemeral: true });
+                } catch (e) {
+                    await interaction.followUp({ content: '✅ 接單成功！\n*(⚠️ 系統無法傳送私訊給您，請確認您的隱私設定是否開啟「允許來自伺服器成員的私人訊息」)*', ephemeral: true });
+                }
                 return;
             }
 
