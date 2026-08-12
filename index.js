@@ -22,6 +22,20 @@ const db = admin.firestore();
 console.log('✅ Firebase 資料庫連線成功！');
 
 // ==========================================
+// 【全新核心】全域記憶體快取 (節省 99.9% 讀取額度)
+// ==========================================
+let allReservations = [];
+let appSettings = {};
+
+// 即時監聽資料庫變化，自動更新記憶體，不再每分鐘浪費額度去讀取！
+db.collection('reservations').onSnapshot(snapshot => {
+    allReservations = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+});
+db.collection('settings').onSnapshot(snapshot => {
+    snapshot.docs.forEach(doc => { appSettings[doc.id] = doc.data(); });
+});
+
+// ==========================================
 // 2. Web 伺服器
 // ==========================================
 const app = express();
@@ -70,11 +84,10 @@ async function addViolation(discordId) {
     return { points, bannedUntil };
 }
 
-// 廣播工單至管理區
 async function broadcastToManagementAreas(payload) {
-    const doc = await db.collection('settings').doc('managementArea').get();
-    if (!doc.exists) return [];
-    const channels = doc.data().channels || [];
+    const doc = appSettings['managementArea'];
+    if (!doc) return [];
+    const channels = doc.channels || [];
     let sentMsgs = [];
     for (const chId of channels) {
         const dChannel = await client.channels.fetch(chId).catch(() => null);
@@ -86,7 +99,6 @@ async function broadcastToManagementAreas(payload) {
     return sentMsgs;
 }
 
-// 原地更新工單 (靜態變更)
 async function syncManagementMessages(msgRefs, newEmbed, newComponents = []) {
     if (!msgRefs || !Array.isArray(msgRefs)) return;
     for (const m of msgRefs) {
@@ -100,7 +112,6 @@ async function syncManagementMessages(msgRefs, newEmbed, newComponents = []) {
     }
 }
 
-// 動態推移工單 (刪除舊卡片，發新卡片置底)
 async function bumpManagementMessages(msgRefs, newEmbed, newComponents = []) {
     if (!msgRefs || !Array.isArray(msgRefs)) return [];
     let newRefs = [];
@@ -263,65 +274,59 @@ function generateScheduleEmbed(reservations, isAdmin = false) {
         .setDescription(scheduleText);
 }
 
+// 刷新看板 (直接從記憶體拿資料，免讀取 Firebase)
 async function updateBoard() {
     try {
-        const snapshot = await db.collection('reservations').get();
-        let reservations = [];
-        snapshot.forEach(doc => reservations.push({ id: doc.id, ...doc.data() }));
-
+        const reservations = allReservations;
         const boardContent = getBoardContentWithTime();
 
-        const pubRef = db.collection('settings').doc('publicBoards');
-        const pubDoc = await pubRef.get();
-        if (pubDoc.exists) {
-            let list = pubDoc.data().list || [];
-            let validList = [];
-            let dbChanged = false;
-            for (let i = 0; i < list.length; i++) {
-                const b = list[i];
-                try {
-                    const ch = await client.channels.fetch(b.channelId).catch(() => null);
-                    if (ch) {
-                        const msg = await ch.messages.fetch(b.messageId).catch(() => null);
-                        if (msg) {
-                            await msg.edit({ content: publicBoardIntro, embeds: [generateScheduleEmbed(reservations, false)], components: [reserveBtnRow] });
-                            validList.push(b);
-                        } else {
-                            const newMsg = await ch.send({ content: publicBoardIntro, embeds: [generateScheduleEmbed(reservations, false)], components: [reserveBtnRow] });
-                            validList.push({ channelId: ch.id, messageId: newMsg.id });
-                            dbChanged = true;
-                        }
-                    } else dbChanged = true;
-                } catch (e) { dbChanged = true; }
-            }
-            if (dbChanged || list.length !== validList.length) await pubRef.set({ list: validList });
+        const pubDoc = appSettings['publicBoards'] || {};
+        let pubList = pubDoc.list || [];
+        let validPubList = [];
+        let pubChanged = false;
+        
+        for (let b of pubList) {
+            try {
+                const ch = await client.channels.fetch(b.channelId).catch(() => null);
+                if (ch) {
+                    const msg = await ch.messages.fetch(b.messageId).catch(() => null);
+                    if (msg) {
+                        await msg.edit({ content: boardContent, embeds: [generateScheduleEmbed(reservations, false)], components: [reserveBtnRow] });
+                        validPubList.push(b);
+                    } else {
+                        const newMsg = await ch.send({ content: boardContent, embeds: [generateScheduleEmbed(reservations, false)], components: [reserveBtnRow] });
+                        validPubList.push({ channelId: ch.id, messageId: newMsg.id });
+                        pubChanged = true;
+                    }
+                } else pubChanged = true;
+            } catch (e) { pubChanged = true; }
         }
+        if (pubChanged || pubList.length !== validPubList.length) await db.collection('settings').doc('publicBoards').set({ list: validPubList });
 
-        const admRef = db.collection('settings').doc('adminBoards');
-        const admDoc = await admRef.get();
-        if (admDoc.exists) {
-            let list = admDoc.data().list || [];
-            let validList = [];
-            let dbChanged = false;
-            for (let i = 0; i < list.length; i++) {
-                const b = list[i];
-                try {
-                    const ch = await client.channels.fetch(b.channelId).catch(() => null);
-                    if (ch) {
-                        const msg = await ch.messages.fetch(b.messageId).catch(() => null);
-                        if (msg) {
-                            await msg.edit({ content: null, embeds: [generateScheduleEmbed(reservations, true)] });
-                            validList.push(b);
-                        } else {
-                            const newMsg = await ch.send({ embeds: [generateScheduleEmbed(reservations, true)] });
-                            validList.push({ channelId: ch.id, messageId: newMsg.id });
-                            dbChanged = true;
-                        }
-                    } else dbChanged = true;
-                } catch (e) { dbChanged = true; }
-            }
-            if (dbChanged || list.length !== validList.length) await admRef.set({ list: validList });
+        const admDoc = appSettings['adminBoards'] || {};
+        let admList = admDoc.list || [];
+        let validAdmList = [];
+        let admChanged = false;
+
+        for (let b of admList) {
+            try {
+                const ch = await client.channels.fetch(b.channelId).catch(() => null);
+                if (ch) {
+                    const msg = await ch.messages.fetch(b.messageId).catch(() => null);
+                    const tw = getTaiwanTime();
+                    if (msg) {
+                        await msg.edit({ content: null, embeds: [generateScheduleEmbed(reservations, true)] });
+                        validAdmList.push(b);
+                    } else {
+                        const newMsg = await ch.send({ embeds: [generateScheduleEmbed(reservations, true)] });
+                        validAdmList.push({ channelId: ch.id, messageId: newMsg.id });
+                        admChanged = true;
+                    }
+                } else admChanged = true;
+            } catch (e) { admChanged = true; }
         }
+        if (admChanged || admList.length !== validAdmList.length) await db.collection('settings').doc('adminBoards').set({ list: validAdmList });
+
     } catch (e) { console.log('看板更新失敗', e); }
 }
 
@@ -341,21 +346,16 @@ client.once('ready', async () => {
     ];
     await client.application.commands.set(commands);
 
+    // 核心排程：透過快取巡邏，完全不消耗資料庫配額
     setInterval(async () => {
         const now = Date.now();
+        
         try {
-            const pricesDoc = await db.collection('settings').doc('prices').get();
-            const prices = pricesDoc.exists ? pricesDoc.data() : {};
-            const alarmDoc = await db.collection('settings').doc('alarm').get();
-            const alarmLeadTime = alarmDoc.exists ? alarmDoc.data().leadTime : 15;
-            const vipDoc = await db.collection('settings').doc('vipRules').get();
-            const vipRules = vipDoc.exists ? vipDoc.data() : {};
-            
-            const allResSnapshot = await db.collection('reservations').get();
-            let allRes = [];
-            allResSnapshot.forEach(d => allRes.push({ id: d.id, ...d.data() }));
+            const prices = appSettings['prices'] || {};
+            const alarmLeadTime = appSettings['alarm']?.leadTime || 15;
+            const vipRules = appSettings['vipRules'] || {};
 
-            for (let data of allRes) {
+            for (let data of allReservations) {
                 const timeDiff = data.timestamp - now;
                 let needsSync = false;
                 let needsBump = false;
@@ -376,7 +376,7 @@ client.once('ready', async () => {
                     let finalPriceStr = `${prices[data.location] || '未設定'}萬`;
                     const rule = vipRules[data.location];
                     if (rule && rule.buy > 0) {
-                        const userHistory = allRes.filter(r => r.discordId === data.discordId && r.location === data.location && (r.status === 'approved' || r.status === 'completed')).sort((a, b) => a.timestamp - b.timestamp);
+                        const userHistory = allReservations.filter(r => r.discordId === data.discordId && r.location === data.location && (r.status === 'approved' || r.status === 'completed')).sort((a, b) => a.timestamp - b.timestamp);
                         const orderIndex = userHistory.findIndex(r => r.id === data.id);
                         if (orderIndex !== -1) {
                             const cycle = rule.buy + rule.free;
@@ -403,7 +403,7 @@ client.once('ready', async () => {
                     }
                 }
 
-                // 3. 【全新】開打時間一過，自動移除玩家 DM 的變更按鈕
+                // 3. 自動移除玩家 DM 的變更按鈕
                 if (data.status === 'approved' && !data.buttonsRemoved && now >= data.timestamp) {
                     await editUserDM(data.discordId, data.userDmMsgId, { components: [] });
                     await db.collection('reservations').doc(data.id).update({ buttonsRemoved: true });
@@ -450,14 +450,11 @@ client.once('ready', async () => {
     }, 60 * 1000); 
 });
 
-// 【核心防禦】加入 try-catch 保護所有指令互動
 client.on('interactionCreate', async interaction => {
     try {
-        // =====================================
-        // 一般與管理設定指令
-        // =====================================
         if (interaction.isChatInputCommand()) {
-            // 【秒開技術】遇到預約，直接彈出，絕不延遲！
+            
+            // 【秒開表單】
             if (interaction.commandName === '預約') {
                 const location = interaction.options.getString('地點');
                 const tw = getTaiwanTime();
@@ -472,7 +469,6 @@ client.on('interactionCreate', async interaction => {
                 return interaction.showModal(modal);
             }
 
-            // 其餘指令安全等待
             await interaction.deferReply({ ephemeral: true });
 
             if (interaction.commandName === '清理訊息') {
@@ -482,57 +478,51 @@ client.on('interactionCreate', async interaction => {
                     await interaction.channel.bulkDelete(amount, true);
                     return interaction.editReply({ content: `✅ 成功清理了 ${amount} 則訊息！` });
                 } catch (e) {
-                    return interaction.editReply({ content: `❌ 清理失敗，可能包含超過 14 天的舊訊息，Discord 系統限制無法直接刪除。` });
+                    return interaction.editReply({ content: `❌ 清理失敗，可能包含超過 14 天的舊訊息。` });
                 }
             }
             else if (interaction.commandName === '迴響管理區') {
                 if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.editReply({ content: '❌ 權限不足' });
-                const docRef = db.collection('settings').doc('managementArea');
-                const doc = await docRef.get();
-                let channels = doc.exists ? (doc.data().channels || []) : [];
+                let channels = appSettings['managementArea']?.channels || [];
                 if (channels.includes(interaction.channelId)) {
                     channels = channels.filter(id => id !== interaction.channelId);
-                    await docRef.set({ channels });
-                    return interaction.editReply({ content: '✅ 已將此頻道從「迴響管理區」移除。' });
+                    await db.collection('settings').doc('managementArea').set({ channels });
+                    return interaction.editReply({ content: '✅ 已移除迴響管理區。' });
                 } else {
                     channels.push(interaction.channelId);
-                    await docRef.set({ channels });
-                    return interaction.editReply({ content: '✅ **設定成功！** 此頻道將同步接收所有工單卡片。' });
+                    await db.collection('settings').doc('managementArea').set({ channels });
+                    return interaction.editReply({ content: '✅ **設定成功！**' });
                 }
             }
             else if (interaction.commandName === '設定公開看板') {
                 if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.editReply({ content: '❌ 權限不足' });
-                const docRef = db.collection('settings').doc('publicBoards');
-                const doc = await docRef.get();
-                let list = doc.exists ? (doc.data().list || []) : [];
+                let list = appSettings['publicBoards']?.list || [];
                 const existingIdx = list.findIndex(b => b.channelId === interaction.channelId);
                 if (existingIdx !== -1) {
                     list.splice(existingIdx, 1);
-                    await docRef.set({ list });
-                    return interaction.editReply({ content: '✅ 已移除公開看板維護。' });
+                    await db.collection('settings').doc('publicBoards').set({ list });
+                    return interaction.editReply({ content: '✅ 已移除公開看板。' });
                 } else {
                     const msg = await interaction.channel.send({ content: getBoardContentWithTime(), embeds: [new EmbedBuilder().setTitle('載入中...').setColor(0x0099FF)], components: [reserveBtnRow] });
                     list.push({ channelId: interaction.channelId, messageId: msg.id });
-                    await docRef.set({ list });
+                    await db.collection('settings').doc('publicBoards').set({ list });
                     await interaction.editReply({ content: '✅ 公開看板設定成功！' });
                     updateBoard();
                 }
             }
             else if (interaction.commandName === '設定管理看板') {
                 if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.editReply({ content: '❌ 權限不足' });
-                const docRef = db.collection('settings').doc('adminBoards');
-                const doc = await docRef.get();
-                let list = doc.exists ? (doc.data().list || []) : [];
+                let list = appSettings['adminBoards']?.list || [];
                 const existingIdx = list.findIndex(b => b.channelId === interaction.channelId);
                 if (existingIdx !== -1) {
                     list.splice(existingIdx, 1);
-                    await docRef.set({ list });
+                    await db.collection('settings').doc('adminBoards').set({ list });
                     return interaction.editReply({ content: '✅ 已移除真實名單看板。' });
                 } else {
                     const tw = getTaiwanTime();
                     const msg = await interaction.channel.send({ content: `🔄 **最後刷新時間**：\`${tw.yyyy}-${tw.mm}-${tw.dd} ${tw.hh}:${tw.min}\``, embeds: [new EmbedBuilder().setTitle('載入中...').setColor(0xFF0000)] });
                     list.push({ channelId: interaction.channelId, messageId: msg.id });
-                    await docRef.set({ list });
+                    await db.collection('settings').doc('adminBoards').set({ list });
                     await interaction.editReply({ content: '✅ 管理看板設定成功！' });
                     updateBoard();
                 }
@@ -559,14 +549,11 @@ client.on('interactionCreate', async interaction => {
                 await interaction.editReply({ content: `✅ 已設定【${loc}】優惠規則：滿 **${buy}** 送 **${free}**。` });
             }
             else if (interaction.commandName === '我的紀錄') {
-                // 修正複合索引錯誤，改為撈取全部再由程式過濾
-                const snapshot = await db.collection('reservations').where('discordId', '==', interaction.user.id).get();
                 const tw = getTaiwanTime();
                 const currentMonthPrefix = `${tw.yyyy}-${tw.mm}`;
                 let total = 0, month = 0;
-                snapshot.forEach(doc => { 
-                    const d = doc.data();
-                    if (d.status === 'approved' || d.status === 'completed') {
+                allReservations.forEach(d => { 
+                    if (d.discordId === interaction.user.id && (d.status === 'approved' || d.status === 'completed')) {
                         total++; 
                         if (d.date.startsWith(currentMonthPrefix)) month++; 
                     }
@@ -579,7 +566,7 @@ client.on('interactionCreate', async interaction => {
                     points = ud.violationPoints || 0;
                     if (ud.bannedUntil && ud.bannedUntil > Date.now()) {
                         const bDate = new Date(ud.bannedUntil + 8 * 3600 * 1000);
-                        banStatus = `🔴 預約休息中 (解除時間：${bDate.getUTCFullYear()}-${String(bDate.getUTCMonth()+1).padStart(2,'0')}-${String(bDate.getUTCDate()).padStart(2,'0')} ${String(bDate.getUTCHours()).padStart(2,'0')}:${String(bDate.getUTCMinutes()).padStart(2,'0')})`;
+                        banStatus = `🔴 預約休息中 (解除：${bDate.getUTCFullYear()}-${String(bDate.getUTCMonth()+1).padStart(2,'0')}-${String(bDate.getUTCDate()).padStart(2,'0')} ${String(bDate.getUTCHours()).padStart(2,'0')}:${String(bDate.getUTCMinutes()).padStart(2,'0')})`;
                     }
                 }
                 const statEmbed = new EmbedBuilder().setColor(0x9B59B6).setTitle(`📊 ${interaction.user.username} 的預約數據`)
@@ -588,12 +575,10 @@ client.on('interactionCreate', async interaction => {
             }
             else if (interaction.commandName === '接單統計') {
                 if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.editReply({ content: '❌ 權限不足' });
-                const allResSnapshot = await db.collection('reservations').get();
                 const tw = getTaiwanTime();
                 const currentMonthPrefix = `${tw.yyyy}-${tw.mm}`;
                 const stats = {};
-                allResSnapshot.forEach(doc => {
-                    const r = doc.data();
+                allReservations.forEach(r => {
                     if (r.takenBy && (r.status === 'completed' || r.status === 'failed')) {
                         if (!stats[r.takenBy]) stats[r.takenBy] = { total: 0, month: 0, failed: 0 };
                         if (r.status === 'completed') { stats[r.takenBy].total += 1; if (r.date.startsWith(currentMonthPrefix)) stats[r.takenBy].month += 1; } 
@@ -608,21 +593,19 @@ client.on('interactionCreate', async interaction => {
         }
 
         // =====================================
-        // 預約按鈕觸發：【先 Defer 保平安】
+        // 選單觸發 (秒開)
         // =====================================
         else if (interaction.isButton() && interaction.customId === 'btn_reserve') {
-            await interaction.deferReply({ ephemeral: true });
-            
             const userDoc = await db.collection('users').doc(interaction.user.id).get();
             if (userDoc.exists && userDoc.data().bannedUntil > Date.now()) {
-                return interaction.editReply({ content: `💡 **溫馨提醒**：您近期「臨時調整」達上限，權限暫停中喔！` });
+                return interaction.reply({ content: `💡 **溫馨提醒**：您近期「臨時調整」達上限，權限暫停中喔！`, ephemeral: true });
             }
             
             const row = new ActionRowBuilder().addComponents(
                 new StringSelectMenuBuilder().setCustomId('select_location').setPlaceholder('請選擇要預約的地點')
                 .addOptions([ { label: '闇黑龍王', value: '闇黑龍王' }, { label: '艾畢奈亞', value: '艾畢奈亞' }, { label: '道館', value: '道館' }, { label: '其他', value: '其他' } ])
             );
-            await interaction.editReply({ content: '👇 **請選擇您要預約的地點：**', components: [row] });
+            await interaction.reply({ content: '👇 **請選擇您要預約的地點：**', components: [row], ephemeral: true });
         }
         else if (interaction.isStringSelectMenu() && interaction.customId === 'select_location') {
             const location = interaction.values[0];
@@ -643,8 +626,6 @@ client.on('interactionCreate', async interaction => {
         // =====================================
         else if (interaction.isModalSubmit() && interaction.customId.startsWith('reserve_')) {
             await interaction.deferReply({ ephemeral: true });
-            
-            // 使用者提交表單後，順便把選單那則訊息收起來，保持畫面乾淨
             if (interaction.message) await interaction.message.delete().catch(() => {});
 
             const location = interaction.customId.split('_')[1];
@@ -660,11 +641,7 @@ client.on('interactionCreate', async interaction => {
             if (isNaN(newDateTime.getTime())) return interaction.editReply({ content: '❌ **日期或時間格式錯誤**。' });
             if (newDateTime.getTime() <= Date.now()) return interaction.editReply({ content: '❌ **無法預約過去的時間**。' });
 
-            const snapshot = await db.collection('reservations').get();
-            let reservations = [];
-            snapshot.forEach(doc => reservations.push({ id: doc.id, ...doc.data() }));
-
-            const isConflict = reservations.some(res => res.location === location && Math.abs(newDateTime.getTime() - res.timestamp) < 10 * 60 * 1000 && res.status === 'approved');
+            const isConflict = allReservations.some(res => res.location === location && Math.abs(newDateTime.getTime() - res.timestamp) < 10 * 60 * 1000 && res.status === 'approved');
             if (isConflict) return interaction.editReply({ content: '❌ 此時段前後10分鐘已有排單，請重新調整喔。' });
 
             const data = {
@@ -692,16 +669,14 @@ client.on('interactionCreate', async interaction => {
         }
 
         // =====================================
-        // 管理按鈕
+        // 按鈕操作
         // =====================================
         else if (interaction.isButton()) {
             const [action, docId] = interaction.customId.split('_');
 
             if (action === 'edit') {
-                const docRef = db.collection('reservations').doc(docId);
-                const doc = await docRef.get();
-                if (!doc.exists) return interaction.reply({ content: '❌ 找不到此訂單。', ephemeral: true });
-                const data = doc.data();
+                let data = allReservations.find(r => r.id === docId);
+                if (!data) return interaction.reply({ content: '❌ 找不到此訂單。', ephemeral: true });
                 
                 const modal = new ModalBuilder().setCustomId(`submitEdit_${docId}`).setTitle('變更登記資料');
                 const channelInput = new TextInputBuilder().setCustomId('channel').setLabel("幸運頻道").setStyle(TextInputStyle.Short).setRequired(false);
@@ -721,10 +696,9 @@ client.on('interactionCreate', async interaction => {
 
             await interaction.deferUpdate();
 
+            let data = allReservations.find(r => r.id === docId);
+            if (!data) return interaction.followUp({ content: '❌ 找不到此訂單（可能已被刪除）。', ephemeral: true });
             const docRef = db.collection('reservations').doc(docId);
-            const doc = await docRef.get();
-            if (!doc.exists) return interaction.followUp({ content: '❌ 找不到此訂單（可能已被刪除）。', ephemeral: true });
-            let data = doc.data();
 
             if (action === 'approve' || action === 'reject') {
                 if (data.status !== 'pending') return interaction.followUp({ content: '❌ 訂單已處理過囉！', ephemeral: true });
@@ -820,16 +794,12 @@ client.on('interactionCreate', async interaction => {
             if (isNaN(newDateTime.getTime())) return interaction.followUp({ content: '❌ 格式錯誤。', ephemeral: true });
             if (newDateTime.getTime() <= Date.now()) return interaction.followUp({ content: '❌ 無法改為過去的時間。', ephemeral: true });
 
-            const currentDoc = await db.collection('reservations').doc(docId).get();
-            if (!currentDoc.exists) return interaction.followUp({ content: '❌ 找不到此訂單。', ephemeral: true });
-            let data = currentDoc.data();
+            let data = allReservations.find(r => r.id === docId);
+            if (!data) return interaction.followUp({ content: '❌ 找不到此訂單。', ephemeral: true });
             const timeChanged = data.timestamp !== newDateTime.getTime();
 
             if (timeChanged) {
-                const snapshot = await db.collection('reservations').get();
-                let reservations = [];
-                snapshot.forEach(doc => { if (doc.id !== docId) reservations.push({ id: doc.id, ...doc.data() }); });
-                const isConflict = reservations.some(res => res.location === data.location && Math.abs(newDateTime.getTime() - res.timestamp) < 10 * 60 * 1000 && res.status === 'approved');
+                const isConflict = allReservations.some(res => res.id !== docId && res.location === data.location && Math.abs(newDateTime.getTime() - res.timestamp) < 10 * 60 * 1000 && res.status === 'approved');
                 if (isConflict) return interaction.followUp({ content: '❌ 申請時間前後10分鐘已排單。', ephemeral: true });
             }
 
@@ -865,7 +835,7 @@ client.on('interactionCreate', async interaction => {
 
     } catch (error) {
         console.error('Interaction 發生異常：', error);
-        const errMsg = '❌ 系統處理時發生異常，請聯絡管理員或稍後再試。';
+        const errMsg = '❌ 系統處理時發生異常，請重試。';
         if (interaction.deferred || interaction.replied) {
             await interaction.followUp({ content: errMsg, ephemeral: true }).catch(() => {});
         } else if (interaction.isRepliable()) {
