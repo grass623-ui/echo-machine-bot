@@ -51,11 +51,6 @@ function getTaiwanTime() {
     };
 }
 
-function getBoardContentWithTime() {
-    const tw = getTaiwanTime();
-    return `${publicBoardIntro}\n\n🔄 **最後刷新時間**：\`${tw.yyyy}-${tw.mm}-${tw.dd} ${tw.hh}:${tw.min}\``;
-}
-
 async function addViolation(discordId) {
     const userRef = db.collection('users').doc(discordId);
     const doc = await userRef.get();
@@ -86,7 +81,7 @@ async function broadcastToManagementAreas(payload) {
     return sentMsgs;
 }
 
-// 原地更新工單 (靜態變更，不移動位置)
+// 原地更新工單
 async function syncManagementMessages(msgRefs, newEmbed, newComponents = []) {
     if (!msgRefs || !Array.isArray(msgRefs)) return;
     for (const m of msgRefs) {
@@ -100,7 +95,7 @@ async function syncManagementMessages(msgRefs, newEmbed, newComponents = []) {
     }
 }
 
-// 動態推移工單 (刪除舊卡片，發送新卡片到最下面)
+// 動態推移工單
 async function bumpManagementMessages(msgRefs, newEmbed, newComponents = []) {
     if (!msgRefs || !Array.isArray(msgRefs)) return [];
     let newRefs = [];
@@ -109,8 +104,8 @@ async function bumpManagementMessages(msgRefs, newEmbed, newComponents = []) {
             const ch = await client.channels.fetch(m.channelId).catch(() => null);
             if (ch) {
                 const oldMsg = await ch.messages.fetch(m.messageId).catch(() => null);
-                if (oldMsg) await oldMsg.delete().catch(() => null); // 刪除舊訊息
-                const newMsg = await ch.send({ embeds: [newEmbed], components: newComponents }); // 發送至最下層
+                if (oldMsg) await oldMsg.delete().catch(() => null); 
+                const newMsg = await ch.send({ embeds: [newEmbed], components: newComponents }); 
                 newRefs.push({ channelId: ch.id, messageId: newMsg.id });
             }
         } catch (e) {}
@@ -204,10 +199,10 @@ function buildTicketPayload(docId, data) {
 
     embed.setDescription(baseDesc + timeline);
     if (row.components.length > 0) components.push(row);
-
     return { embeds: [embed], components };
 }
 
+// 產生公開與管理看板 (全新整合式排版)
 function generateScheduleEmbed(reservations, isAdmin = false) {
     const now = Date.now();
     const tw = getTaiwanTime();
@@ -222,46 +217,43 @@ function generateScheduleEmbed(reservations, isAdmin = false) {
         if (r.date.startsWith(currentMonthPrefix)) stats[r.discordId].month += 1;
     });
 
-    let futureRes = reservations
-        .filter(res => res.status === 'approved' && res.timestamp >= now) 
-        .sort((a, b) => a.timestamp - b.timestamp);
-
+    let futureRes = reservations.filter(res => res.status === 'approved' && res.timestamp >= now).sort((a, b) => a.timestamp - b.timestamp);
     if (!isAdmin) futureRes = futureRes.filter(res => res.date === todayStr);
 
-    if (futureRes.length === 0) {
-        return new EmbedBuilder()
-            .setColor(0x0099FF)
-            .setTitle(isAdmin ? '👑【管理員】王團自動排班表' : '👤 迴響預約清單')
-            .setDescription(isAdmin ? '目前沒有任何已通過的未來預約喔！' : '本日目前沒有已通過的預約喔！');
-    }
-
-    const grouped = {};
-    futureRes.forEach(res => {
-        if (!grouped[res.date]) grouped[res.date] = [];
-        grouped[res.date].push(res);
-    });
-
     let scheduleText = '';
-    for (const [date, items] of Object.entries(grouped)) {
-        scheduleText += `\n**📅 ${date}**\n\n`;
-        items.forEach((res) => {
-            const noteText = res.notes && res.notes !== '無' ? ` | 備註：${res.notes}` : '';
-            let channelDisplay = '';
-            let playerInfo = '';
-            
-            if (isAdmin) {
-                const userStats = stats[res.discordId] || { month: 0, total: 0 };
-                channelDisplay = ` | 頻道：${res.channel || '當日決定'}`;
-                playerInfo = `ID：${res.gameId} | <@${res.discordId}> | 本月：${userStats.month}次 | 總：${userStats.total}次`;
-            } else {
-                channelDisplay = ''; 
-                playerInfo = `👤 🔒 匿名玩家`;
-            }
-            
-            scheduleText += `🕒 \`${res.time}\` ── **【${res.location}】**\n`;
-            scheduleText += ` └─ ${playerInfo}${channelDisplay}${noteText}\n\n`;
+
+    if (futureRes.length === 0) {
+        scheduleText += isAdmin ? '目前沒有任何已通過的未來預約喔！\n\n' : '本日目前沒有已通過的預約喔！\n\n';
+    } else {
+        const grouped = {};
+        futureRes.forEach(res => {
+            if (!grouped[res.date]) grouped[res.date] = [];
+            grouped[res.date].push(res);
         });
+
+        for (const [date, items] of Object.entries(grouped)) {
+            scheduleText += `**📅 ${date}**\n\n`;
+            items.forEach((res) => {
+                const noteText = res.notes && res.notes !== '無' ? ` | 備註：${res.notes}` : '';
+                let channelDisplay = '';
+                let playerInfo = '';
+                
+                if (isAdmin) {
+                    const userStats = stats[res.discordId] || { month: 0, total: 0 };
+                    channelDisplay = ` | 頻道：${res.channel || '當日決定'}`;
+                    playerInfo = `ID：${res.gameId} | <@${res.discordId}> | 本月：${userStats.month}次 | 總：${userStats.total}次`;
+                } else {
+                    channelDisplay = ''; 
+                    playerInfo = `👤 🔒 匿名玩家`;
+                }
+                scheduleText += `🕒 \`${res.time}\` ── **【${res.location}】**\n`;
+                scheduleText += ` └─ ${playerInfo}${channelDisplay}${noteText}\n\n`;
+            });
+        }
     }
+
+    // 將刷新時間包裝在 Embed 最底端
+    scheduleText += `🔄 **最後刷新時間**：\`${tw.yyyy}-${tw.mm}-${tw.dd} ${tw.hh}:${tw.min}\``;
 
     return new EmbedBuilder()
         .setColor(isAdmin ? 0xFF0000 : 0x0099FF)
@@ -269,13 +261,12 @@ function generateScheduleEmbed(reservations, isAdmin = false) {
         .setDescription(scheduleText);
 }
 
+// 自動更新看板
 async function updateBoard() {
     try {
         const snapshot = await db.collection('reservations').get();
         let reservations = [];
         snapshot.forEach(doc => reservations.push({ id: doc.id, ...doc.data() }));
-
-        const boardContent = getBoardContentWithTime();
 
         const pubRef = db.collection('settings').doc('publicBoards');
         const pubDoc = await pubRef.get();
@@ -290,10 +281,10 @@ async function updateBoard() {
                     if (ch) {
                         const msg = await ch.messages.fetch(b.messageId).catch(() => null);
                         if (msg) {
-                            await msg.edit({ content: boardContent, embeds: [generateScheduleEmbed(reservations, false)], components: [reserveBtnRow] });
+                            await msg.edit({ content: publicBoardIntro, embeds: [generateScheduleEmbed(reservations, false)], components: [reserveBtnRow] });
                             validList.push(b);
                         } else {
-                            const newMsg = await ch.send({ content: boardContent, embeds: [generateScheduleEmbed(reservations, false)], components: [reserveBtnRow] });
+                            const newMsg = await ch.send({ content: publicBoardIntro, embeds: [generateScheduleEmbed(reservations, false)], components: [reserveBtnRow] });
                             validList.push({ channelId: ch.id, messageId: newMsg.id });
                             dbChanged = true;
                         }
@@ -315,12 +306,11 @@ async function updateBoard() {
                     const ch = await client.channels.fetch(b.channelId).catch(() => null);
                     if (ch) {
                         const msg = await ch.messages.fetch(b.messageId).catch(() => null);
-                        const tw = getTaiwanTime();
                         if (msg) {
-                            await msg.edit({ content: `🔄 **最後刷新時間**：\`${tw.yyyy}-${tw.mm}-${tw.dd} ${tw.hh}:${tw.min}\``, embeds: [generateScheduleEmbed(reservations, true)] });
+                            await msg.edit({ content: null, embeds: [generateScheduleEmbed(reservations, true)] });
                             validList.push(b);
                         } else {
-                            const newMsg = await ch.send({ content: `🔄 **最後刷新時間**：\`${tw.yyyy}-${tw.mm}-${tw.dd} ${tw.hh}:${tw.min}\``, embeds: [generateScheduleEmbed(reservations, true)] });
+                            const newMsg = await ch.send({ embeds: [generateScheduleEmbed(reservations, true)] });
                             validList.push({ channelId: ch.id, messageId: newMsg.id });
                             dbChanged = true;
                         }
@@ -348,7 +338,6 @@ client.once('ready', async () => {
     ];
     await client.application.commands.set(commands);
 
-    // 核心排程：巡邏時間線並觸發推進 (Bumping)
     setInterval(async () => {
         const now = Date.now();
         
@@ -369,7 +358,6 @@ client.once('ready', async () => {
                 let needsSync = false;
                 let needsBump = false;
 
-                // 1. 過期清理
                 if (data.status === 'pending' && data.timestamp < now) {
                     data.status = 'expired';
                     await db.collection('reservations').doc(data.id).update({ status: 'expired' });
@@ -377,7 +365,6 @@ client.once('ready', async () => {
                     await editUserDM(data.discordId, data.userDmMsgId, { embeds: [new EmbedBuilder().setColor(0x808080).setTitle('⏳ 預約已過期失效').setDescription(`您的預約因超過開打時間未審核，已自動失效。\n**地點**：${data.location}\n**時間**：${data.date} ${data.time}`)], components: [] });
                 }
 
-                // 2. 鬧鐘階段 (推移置底)
                 if (data.status === 'approved' && !data.reminded && timeDiff <= alarmLeadTime * 60 * 1000 && timeDiff > 0) {
                     data.reminded = true;
                     await db.collection('reservations').doc(data.id).update({ reminded: true });
@@ -402,7 +389,6 @@ client.once('ready', async () => {
                     } catch (e) {}
                 }
 
-                // 3. 結案階段 (推移置底)
                 if (data.status === 'approved' && data.reminded && !data.postChecked && now - data.timestamp >= 10 * 60 * 1000) {
                     data.postChecked = true;
                     let dmFailed = false;
@@ -422,7 +408,6 @@ client.once('ready', async () => {
                     needsBump = true;
                 }
 
-                // 4. 強制逾期結算
                 if (data.status === 'approved' && data.postChecked && now - data.timestamp >= 12 * 60 * 60 * 1000) {
                     data.status = 'failed';
                     data.closer = '系統自動結案';
@@ -430,20 +415,16 @@ client.once('ready', async () => {
                     needsSync = true;
                 }
 
-                // 根據狀態選擇更新方式
                 if (needsBump) {
                     const payload = buildTicketPayload(data.id, data);
                     const newRefs = await bumpManagementMessages(data.ticketMsgs, payload.embeds[0], payload.components);
                     await db.collection('reservations').doc(data.id).update({ ticketMsgs: newRefs });
-                    updateBoard(); 
                 } else if (needsSync) {
                     const payload = buildTicketPayload(data.id, data);
                     await syncManagementMessages(data.ticketMsgs, payload.embeds[0], payload.components);
-                    updateBoard();
                 }
             }
             
-            // 例行性每分鐘更新公開/管理看板的時間 (即使沒有進度改變也要更新右上角刷新時間)
             updateBoard();
             
         } catch (error) { console.error(error); }
@@ -494,7 +475,7 @@ client.on('interactionCreate', async interaction => {
                 await docRef.set({ list });
                 return interaction.editReply({ content: '✅ 已移除公開看板維護。' });
             } else {
-                const msg = await interaction.channel.send({ content: getBoardContentWithTime(), embeds: [new EmbedBuilder().setTitle('載入中...').setColor(0x0099FF)], components: [reserveBtnRow] });
+                const msg = await interaction.channel.send({ content: publicBoardIntro, embeds: [new EmbedBuilder().setTitle('載入中...').setColor(0x0099FF)], components: [reserveBtnRow] });
                 list.push({ channelId: interaction.channelId, messageId: msg.id });
                 await docRef.set({ list });
                 await interaction.editReply({ content: '✅ 公開看板設定成功！' });
@@ -512,8 +493,7 @@ client.on('interactionCreate', async interaction => {
                 await docRef.set({ list });
                 return interaction.editReply({ content: '✅ 已移除真實名單看板。' });
             } else {
-                const tw = getTaiwanTime();
-                const msg = await interaction.channel.send({ content: `🔄 **最後刷新時間**：\`${tw.yyyy}-${tw.mm}-${tw.dd} ${tw.hh}:${tw.min}\``, embeds: [new EmbedBuilder().setTitle('載入中...').setColor(0xFF0000)] });
+                const msg = await interaction.channel.send({ embeds: [new EmbedBuilder().setTitle('載入中...').setColor(0xFF0000)] });
                 list.push({ channelId: interaction.channelId, messageId: msg.id });
                 await docRef.set({ list });
                 await interaction.editReply({ content: '✅ 管理看板設定成功！' });
@@ -586,7 +566,7 @@ client.on('interactionCreate', async interaction => {
     // =====================================
     // 預約觸發與表單處理
     // =====================================
-    else if (interaction.isButton() && interaction.customId === 'btn_reserve') {
+    else if ((interaction.isButton() && interaction.customId === 'btn_reserve') || (interaction.isChatInputCommand() && interaction.commandName === '預約')) {
         const userDoc = await db.collection('users').doc(interaction.user.id).get();
         if (userDoc.exists && userDoc.data().bannedUntil > Date.now()) {
             return interaction.reply({ content: `💡 **溫馨提醒**：您近期「臨時調整」達上限，權限暫停中喔！`, ephemeral: true });
@@ -646,12 +626,13 @@ client.on('interactionCreate', async interaction => {
         await docRef.update({ ticketMsgs: sentMsgs });
 
         const cancelRow = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`cancel_${docRef.id}`).setLabel('🗑️ 取消預約').setStyle(ButtonStyle.Danger));
-        const dmEmbed = new EmbedBuilder().setColor(0xFFA500).setTitle('⏳ 預約等待審核中').setDescription(`等待管理員審核通過後才會加入排班表喔！\n**地點**：${location}\n**時間**：${date} ${time}`);
+        const dmEmbed = new EmbedBuilder().setColor(0xFFA500).setTitle('⏳ 預約等待審核中')
+            .setDescription(`您的訂單已送出，等待管理員審核通過後才會加入排班表喔！\n**地點**：${location}\n**時間**：${date} ${time}`);
 
         try {
             const dmMsg = await interaction.user.send({ embeds: [dmEmbed], components: [cancelRow] });
             await docRef.update({ userDmMsgId: dmMsg.id });
-            await interaction.editReply({ content: `✅ 預約已送出！請查看 DM 等待審核。` });
+            await interaction.editReply({ content: `✅ 預約已送出！請查看 DM 等待審核結果。` });
         } catch (error) {
             await interaction.editReply({ content: `✅ 預約已送出，正在等待審核。\n⚠️ **請開啟接收私訊功能！**` });
         }
@@ -808,7 +789,6 @@ client.on('interactionCreate', async interaction => {
         data.date = newDate; data.time = newTime; data.gameId = newGameId; data.channel = newChannel; data.notes = newNotes;
         data.timestamp = newDateTime.getTime(); data.status = 'pending'; data.reminded = false; data.postChecked = false; data.takenBy = null; data.dmFailed = false;
 
-        // 重新推進置底審核
         const payload = buildTicketPayload(docId, data);
         const newRefs = await bumpManagementMessages(data.ticketMsgs, payload.embeds[0], payload.components);
 
