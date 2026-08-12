@@ -70,7 +70,6 @@ async function addViolation(discordId) {
     return { points, bannedUntil };
 }
 
-// 廣播工單至管理區
 async function broadcastToManagementAreas(payload) {
     const doc = await db.collection('settings').doc('managementArea').get();
     if (!doc.exists) return [];
@@ -86,7 +85,6 @@ async function broadcastToManagementAreas(payload) {
     return sentMsgs;
 }
 
-// 原地更新工單 (靜態變更，不移動位置)
 async function syncManagementMessages(msgRefs, newEmbed, newComponents = []) {
     if (!msgRefs || !Array.isArray(msgRefs)) return;
     for (const m of msgRefs) {
@@ -100,7 +98,6 @@ async function syncManagementMessages(msgRefs, newEmbed, newComponents = []) {
     }
 }
 
-// 動態推移工單 (刪除舊卡片，發送新卡片到最下面)
 async function bumpManagementMessages(msgRefs, newEmbed, newComponents = []) {
     if (!msgRefs || !Array.isArray(msgRefs)) return [];
     let newRefs = [];
@@ -109,8 +106,8 @@ async function bumpManagementMessages(msgRefs, newEmbed, newComponents = []) {
             const ch = await client.channels.fetch(m.channelId).catch(() => null);
             if (ch) {
                 const oldMsg = await ch.messages.fetch(m.messageId).catch(() => null);
-                if (oldMsg) await oldMsg.delete().catch(() => null); // 刪除舊訊息
-                const newMsg = await ch.send({ embeds: [newEmbed], components: newComponents }); // 發送至最下層
+                if (oldMsg) await oldMsg.delete().catch(() => null); 
+                const newMsg = await ch.send({ embeds: [newEmbed], components: newComponents }); 
                 newRefs.push({ channelId: ch.id, messageId: newMsg.id });
             }
         } catch (e) {}
@@ -128,7 +125,6 @@ async function editUserDM(discordId, messageId, payload) {
     } catch (e) {}
 }
 
-// 建立單一工單卡片 (看板狀態機)
 function buildTicketPayload(docId, data) {
     let embed = new EmbedBuilder();
     let components = [];
@@ -342,7 +338,6 @@ client.once('ready', async () => {
     ];
     await client.application.commands.set(commands);
 
-    // 核心排程：巡邏時間線並觸發推進 (Bumping)
     setInterval(async () => {
         const now = Date.now();
         
@@ -366,15 +361,13 @@ client.once('ready', async () => {
 
                 // 1. 過期清理
                 if (data.status === 'pending' && data.timestamp < now) {
-                    data.status = 'expired';
                     await db.collection('reservations').doc(data.id).update({ status: 'expired' });
                     needsSync = true;
                     await editUserDM(data.discordId, data.userDmMsgId, { embeds: [new EmbedBuilder().setColor(0x808080).setTitle('⏳ 預約已過期失效').setDescription(`您的預約因超過開打時間未審核，已自動失效。\n**地點**：${data.location}\n**時間**：${data.date} ${data.time}`)], components: [] });
                 }
 
-                // 2. 鬧鐘階段 (推移置底)
+                // 2. 鬧鐘階段
                 if (data.status === 'approved' && !data.reminded && timeDiff <= alarmLeadTime * 60 * 1000 && timeDiff > 0) {
-                    data.reminded = true;
                     await db.collection('reservations').doc(data.id).update({ reminded: true });
                     needsBump = true; 
 
@@ -393,29 +386,30 @@ client.once('ready', async () => {
                     const twPre5Obj = new Date(pre5MinTime + 8 * 60 * 60 * 1000);
                     const pre5MinStr = String(twPre5Obj.getUTCHours()).padStart(2, '0') + ':' + String(twPre5Obj.getUTCMinutes()).padStart(2, '0');
 
-                    // 🎯 發給「客戶」的私訊鬧鐘
                     try {
                         const user = await client.users.fetch(data.discordId);
-                        await user.send(`🔔 **王團預約提醒鬧鐘**\n您預約的【${data.location}】將在 ${alarmLeadTime} 分鐘後（\`${data.date} ${data.time}\`）於 \`${displayChannel}\` 頻道施放迴響！\n*(請備妥 ${finalPriceStr} 楓幣給迴響機)*`);
+                        await user.send(`🔔 **王團預約提醒鬧鐘**\n您預約的【${data.location}】將在 ${alarmLeadTime} 分鐘後（\`${data.date} ${data.time}\`）於 \`${displayChannel}\` 頻道施放迴響！\n*(請備妥 ${finalPriceStr} 楓幣給專員)*`);
                     } catch (e) {}
 
-                    // 🎯 發給「管理員/接單專員」的鬧鐘
                     if (data.takenBy) {
                         try {
                             const adminUser = await client.users.fetch(data.takenBy);
                             await adminUser.send(`🔔 **王團預約提醒鬧鐘**\n<@${data.discordId}> 與您預約的【${data.location}】須於 ${alarmLeadTime} 分鐘後（\`${data.date} ${data.time}\`）於 \`${displayChannel}\` 頻道施放迴響！\n請記得於（\`${data.date} ${pre5MinStr}\`）上線並準備施放 **英雄的迴響** 喔！`);
                         } catch (e) {}
                     } else {
-                        // 若無人接單，直接在管理區 tag 廣播
                         await broadcastToManagementAreas({ content: `🚨 **【緊急派單通知】**\n<@${data.discordId}> 預約的【${data.location}】將在 ${alarmLeadTime} 分鐘後出團，目前**尚未有專員接單**！\n請盡速點擊下方卡片的「✋ 我來接單」！` });
                     }
                 }
 
-                // 3. 結案階段 (推移置底)
+                // 3. 【全新】開打時間一過，自動移除玩家 DM 的變更按鈕
+                if (data.status === 'approved' && !data.buttonsRemoved && now >= data.timestamp) {
+                    await editUserDM(data.discordId, data.userDmMsgId, { components: [] });
+                    await db.collection('reservations').doc(data.id).update({ buttonsRemoved: true });
+                }
+
+                // 4. 結案階段
                 if (data.status === 'approved' && data.reminded && !data.postChecked && now - data.timestamp >= 10 * 60 * 1000) {
-                    data.postChecked = true;
                     let dmFailed = false;
-                    
                     if (data.takenBy) {
                         try {
                             const adminUser = await client.users.fetch(data.takenBy);
@@ -426,20 +420,21 @@ client.once('ready', async () => {
                             await adminUser.send({ embeds: [new EmbedBuilder().setColor(0x8A2BE2).setTitle('⏱️ 訂單結案確認').setDescription(`**玩家**：<@${data.discordId}>\n**地點**：${data.location}\n**頻道**：${displayChannel}\n**預約時間**：\`${data.date} ${data.time}\`\n\n*請問順利完成了嗎？*`)], components: [row] });
                         } catch (e) { dmFailed = true; }
                     }
-                    data.dmFailed = dmFailed;
                     await db.collection('reservations').doc(data.id).update({ postChecked: true, dmFailed });
                     needsBump = true;
+                    // Ensure local data is updated for bump
+                    data.postChecked = true;
+                    data.dmFailed = dmFailed;
                 }
 
-                // 4. 強制逾期結算
+                // 5. 強制逾期結算
                 if (data.status === 'approved' && data.postChecked && now - data.timestamp >= 12 * 60 * 60 * 1000) {
-                    data.status = 'failed';
-                    data.closer = '系統自動結案';
                     await db.collection('reservations').doc(data.id).update({ status: 'failed', closer: '系統自動結案' });
                     needsSync = true;
+                    data.status = 'failed';
+                    data.closer = '系統自動結案';
                 }
 
-                // 根據狀態選擇更新方式
                 if (needsBump) {
                     const payload = buildTicketPayload(data.id, data);
                     const newRefs = await bumpManagementMessages(data.ticketMsgs, payload.embeds[0], payload.components);
@@ -462,6 +457,21 @@ client.on('interactionCreate', async interaction => {
     // 一般與管理設定指令
     // =====================================
     if (interaction.isChatInputCommand()) {
+        // 【全新】秒開表單技術：遇到預約指令，絕對不可以 deferReply，直接瞬間 showModal
+        if (interaction.commandName === '預約') {
+            const location = interaction.options.getString('地點');
+            const tw = getTaiwanTime();
+            const modal = new ModalBuilder().setCustomId(`reserve_${location}`).setTitle(`📝 預約：${location}`);
+            modal.addComponents(
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('date').setLabel("日期 (可修改)").setStyle(TextInputStyle.Short).setValue(`${tw.yyyy}-${tw.mm}-${tw.dd}`).setRequired(true)),
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('time').setLabel("時間 (24小時制)").setStyle(TextInputStyle.Short).setValue(`${tw.hh}:${tw.min}`).setMaxLength(5).setRequired(true)),
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('gameId').setLabel("預約者遊戲ID").setStyle(TextInputStyle.Short).setRequired(true)),
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('channel').setLabel("幸運頻道").setStyle(TextInputStyle.Short).setRequired(false)), 
+                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('notes').setLabel("備註").setStyle(TextInputStyle.Short).setRequired(false))
+            );
+            return interaction.showModal(modal);
+        }
+
         await interaction.deferReply({ ephemeral: true });
 
         if (interaction.commandName === '清理訊息') {
@@ -471,7 +481,7 @@ client.on('interactionCreate', async interaction => {
                 await interaction.channel.bulkDelete(amount, true);
                 return interaction.editReply({ content: `✅ 成功清理了 ${amount} 則訊息！` });
             } catch (e) {
-                return interaction.editReply({ content: `❌ 清理失敗，可能包含超過 14 天的舊訊息，Discord 系統無法直接刪除太舊的紀錄。` });
+                return interaction.editReply({ content: `❌ 清理失敗，可能包含超過 14 天的舊訊息。` });
             }
         }
         else if (interaction.commandName === '迴響管理區') {
@@ -500,7 +510,7 @@ client.on('interactionCreate', async interaction => {
                 await docRef.set({ list });
                 return interaction.editReply({ content: '✅ 已移除公開看板維護。' });
             } else {
-                const msg = await interaction.channel.send({ content: getBoardContentWithTime(), embeds: [new EmbedBuilder().setTitle('載入中...').setColor(0x0099FF)], components: [reserveBtnRow] });
+                const msg = await interaction.channel.send({ content: publicBoardIntro, embeds: [new EmbedBuilder().setTitle('載入中...').setColor(0x0099FF)], components: [reserveBtnRow] });
                 list.push({ channelId: interaction.channelId, messageId: msg.id });
                 await docRef.set({ list });
                 await interaction.editReply({ content: '✅ 公開看板設定成功！' });
@@ -590,14 +600,9 @@ client.on('interactionCreate', async interaction => {
     }
 
     // =====================================
-    // 預約觸發與表單處理
+    // 預約觸發：【秒開選單/表單，絕對不當機】
     // =====================================
-    else if ((interaction.isButton() && interaction.customId === 'btn_reserve') || (interaction.isChatInputCommand() && interaction.commandName === '預約')) {
-        const userDoc = await db.collection('users').doc(interaction.user.id).get();
-        if (userDoc.exists && userDoc.data().bannedUntil > Date.now()) {
-            return interaction.reply({ content: `💡 **溫馨提醒**：您近期「臨時調整」達上限，權限暫停中喔！`, ephemeral: true });
-        }
-        
+    else if (interaction.isButton() && interaction.customId === 'btn_reserve') {
         const row = new ActionRowBuilder().addComponents(
             new StringSelectMenuBuilder().setCustomId('select_location').setPlaceholder('請選擇要預約的地點')
             .addOptions([ { label: '闇黑龍王', value: '闇黑龍王' }, { label: '艾畢奈亞', value: '艾畢奈亞' }, { label: '道館', value: '道館' }, { label: '其他', value: '其他' } ])
@@ -606,20 +611,27 @@ client.on('interactionCreate', async interaction => {
     }
     else if (interaction.isStringSelectMenu() && interaction.customId === 'select_location') {
         const location = interaction.values[0];
-        const modal = new ModalBuilder().setCustomId(`reserve_${location}`).setTitle(`📝 預約：${location}`);
         const tw = getTaiwanTime();
+        const modal = new ModalBuilder().setCustomId(`reserve_${location}`).setTitle(`📝 預約：${location}`);
         modal.addComponents(
             new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('date').setLabel("日期 (可修改)").setStyle(TextInputStyle.Short).setValue(`${tw.yyyy}-${tw.mm}-${tw.dd}`).setRequired(true)),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('time').setLabel("時間 (24小時制，可修改)").setStyle(TextInputStyle.Short).setValue(`${tw.hh}:${tw.min}`).setMaxLength(5).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('time').setLabel("時間 (24小時制)").setStyle(TextInputStyle.Short).setValue(`${tw.hh}:${tw.min}`).setMaxLength(5).setRequired(true)),
             new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('gameId').setLabel("預約者遊戲ID").setStyle(TextInputStyle.Short).setRequired(true)),
             new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('channel').setLabel("幸運頻道").setStyle(TextInputStyle.Short).setRequired(false)), 
             new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('notes').setLabel("備註").setStyle(TextInputStyle.Short).setRequired(false))
         );
         await interaction.showModal(modal);
     }
+
+    // 表單送出處理 (這裡才會去查資料庫，因此表單可以瞬間打開)
     else if (interaction.isModalSubmit() && interaction.customId.startsWith('reserve_')) {
         await interaction.deferReply({ ephemeral: true });
         
+        const userDoc = await db.collection('users').doc(interaction.user.id).get();
+        if (userDoc.exists && userDoc.data().bannedUntil > Date.now()) {
+            return interaction.editReply({ content: `💡 **溫馨提醒**：您近期「臨時調整」達上限，預約權限暫停中喔！` });
+        }
+
         const location = interaction.customId.split('_')[1];
         const date = interaction.fields.getTextInputValue('date').replace(/\//g, '-');
         let time = interaction.fields.getTextInputValue('time');
@@ -699,6 +711,7 @@ client.on('interactionCreate', async interaction => {
         if (!doc.exists) return interaction.followUp({ content: '❌ 找不到此訂單（可能已被刪除）。', ephemeral: true });
         let data = doc.data();
 
+        // 審核
         if (action === 'approve' || action === 'reject') {
             if (data.status !== 'pending') return interaction.followUp({ content: '❌ 訂單已處理過囉！', ephemeral: true });
             data.status = action === 'approve' ? 'approved' : 'rejected';
@@ -709,7 +722,7 @@ client.on('interactionCreate', async interaction => {
             await syncManagementMessages(data.ticketMsgs, payload.embeds[0], payload.components);
             
             if (action === 'approve') {
-                const dmEmbed = new EmbedBuilder().setColor(0x00FF00).setTitle('✅ 預約已審核通過').setDescription(`正式加入排班表！\n**地點**：${data.location}\n**時間**：${data.date} ${data.time}`);
+                const dmEmbed = new EmbedBuilder().setColor(0x00FF00).setTitle('✅ 預約已通過').setDescription(`**地點**：${data.location}\n**時間**：${data.date} ${data.time}`);
                 const btnRow = new ActionRowBuilder().addComponents(
                     new ButtonBuilder().setCustomId(`edit_${docId}`).setLabel('✏️ 變更登記資料').setStyle(ButtonStyle.Success),
                     new ButtonBuilder().setCustomId(`cancel_${docId}`).setLabel('🗑️ 取消預約').setStyle(ButtonStyle.Danger)
@@ -723,6 +736,7 @@ client.on('interactionCreate', async interaction => {
             return;
         }
 
+        // 接單
         if (action === 'takeOrder') {
             if (data.takenBy) return interaction.followUp({ content: '❌ 已經被接走囉！', ephemeral: true });
             data.takenBy = interaction.user.id;
@@ -733,6 +747,7 @@ client.on('interactionCreate', async interaction => {
             return;
         }
 
+        // 結案
         if (action === 'complete' || action === 'fail') {
             if (data.status === 'completed' || data.status === 'failed') return interaction.followUp({ content: '❌ 已經結案過了！', ephemeral: true });
             if (data.takenBy && data.takenBy !== interaction.user.id) return interaction.followUp({ content: `❌ 只有專員 <@${data.takenBy}> 才能確認結案！`, ephemeral: true });
@@ -774,6 +789,7 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
+    // 處理：修改表單送出
     else if (interaction.isModalSubmit() && interaction.customId.startsWith('submitEdit_')) {
         await interaction.deferUpdate(); 
         
