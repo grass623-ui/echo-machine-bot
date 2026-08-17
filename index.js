@@ -161,7 +161,6 @@ function buildTicketPayload(docId, data) {
     let components = [];
     let row = new ActionRowBuilder();
 
-    // 【名稱防呆優化】加上 discordName 以防 Discord 快取失效顯示出醜陋的 ID
     const playerNameDisplay = data.discordName ? ` (${data.discordName})` : '';
     const baseDesc = `**玩家**：<@${data.discordId}>${playerNameDisplay} (遊戲ID: ${data.gameId})\n**地點**：${data.location}\n**頻道**：${data.channel || '-'}\n**預約時間**：\`${data.date} ${data.time}\`\n**備註**：${data.notes || '無'}\n\n**📋 訂單時間線**：\n`;
     let timeline = '';
@@ -190,6 +189,9 @@ function buildTicketPayload(docId, data) {
             if (!data.reminded) {
                 embed.setColor(0x00FF00).setTitle('🟢 訂單已排程');
                 timeline += `> ⏳ 等待鬧鐘發送...\n`;
+                if (data.takenBy) { // 已提早接單，提供轉單
+                    row.addComponents(new ButtonBuilder().setCustomId(`release_${docId}`).setLabel('🔄 釋出轉單').setStyle(ButtonStyle.Secondary));
+                }
             } else if (data.reminded && !data.postChecked) {
                 if (!data.takenBy) {
                     embed.setColor(0xFFA500).setTitle('🚨 準備出團 (等待接單)');
@@ -199,6 +201,7 @@ function buildTicketPayload(docId, data) {
                     embed.setColor(0x00FF00).setTitle('🟢 專員已接單');
                     timeline += `> ✅ 專員接單 (專員：<@${data.takenBy}>)\n`;
                     timeline += `> ⏳ 等待出團與結案...\n`;
+                    row.addComponents(new ButtonBuilder().setCustomId(`release_${docId}`).setLabel('🔄 釋出轉單').setStyle(ButtonStyle.Secondary));
                 }
             } else if (data.postChecked) {
                 embed.setColor(0x8A2BE2).setTitle('🟣 等待結案回報');
@@ -209,6 +212,7 @@ function buildTicketPayload(docId, data) {
                         timeline += `> ⚠️ 無法私訊，請在此直接結案！\n`;
                         row.addComponents(
                             new ButtonBuilder().setCustomId(`complete_${docId}`).setLabel('⭕ 順利完成').setStyle(ButtonStyle.Success),
+                            new ButtonBuilder().setCustomId(`free_${docId}`).setLabel('🎁 免單').setStyle(ButtonStyle.Primary),
                             new ButtonBuilder().setCustomId(`fail_${docId}`).setLabel('❌ 未完成/取消').setStyle(ButtonStyle.Danger)
                         );
                     }
@@ -217,6 +221,7 @@ function buildTicketPayload(docId, data) {
                     timeline += `> 🟡 等待任何專員幫忙補結案...\n`;
                     row.addComponents(
                         new ButtonBuilder().setCustomId(`complete_${docId}`).setLabel('⭕ 順利完成').setStyle(ButtonStyle.Success),
+                        new ButtonBuilder().setCustomId(`free_${docId}`).setLabel('🎁 免單').setStyle(ButtonStyle.Primary),
                         new ButtonBuilder().setCustomId(`fail_${docId}`).setLabel('❌ 未完成/取消').setStyle(ButtonStyle.Danger)
                     );
                 }
@@ -225,6 +230,10 @@ function buildTicketPayload(docId, data) {
             embed.setColor(0x00FF00).setTitle('⭕ 訂單已結案 (順利完成)');
             if (data.takenBy) timeline += `> ✅ 專員接單 (專員：<@${data.takenBy}>)\n`;
             timeline += `> ⭕ 順利完成 (確認：<@${data.closer || data.takenBy}>)\n`;
+        } else if (data.status === 'free') {
+            embed.setColor(0xFFD700).setTitle('🎁 訂單已結案 (免單)');
+            if (data.takenBy) timeline += `> ✅ 專員接單 (專員：<@${data.takenBy}>)\n`;
+            timeline += `> 🎁 免單 (確認：<@${data.closer || data.takenBy}>)\n`;
         } else if (data.status === 'failed') {
             embed.setColor(0xFF0000).setTitle('❌ 訂單已結案 (未完成/取消)');
             if (data.takenBy) timeline += `> ✅ 專員接單 (專員：<@${data.takenBy}>)\n`;
@@ -237,7 +246,8 @@ function buildTicketPayload(docId, data) {
     return { embeds: [embed], components };
 }
 
-function generateScheduleEmbed(reservations, isAdmin = false) {
+// 【升級】引入分頁機制，防範超過 Discord Embed 6000字元限制
+function generateScheduleEmbed(reservations, isAdmin = false, page = 1, isCommand = false) {
     const now = Date.now();
     const tw = getTaiwanTime();
     const todayStr = `${tw.yyyy}-${tw.mm}-${tw.dd}`;
@@ -245,7 +255,7 @@ function generateScheduleEmbed(reservations, isAdmin = false) {
 
     const stats = {};
     reservations.forEach(r => {
-        if (r.status !== 'approved' && r.status !== 'completed') return;
+        if (r.status !== 'approved' && r.status !== 'completed' && r.status !== 'free') return;
         if (!stats[r.discordId]) stats[r.discordId] = { total: 0, month: 0 };
         stats[r.discordId].total += 1;
         if (r.date.startsWith(currentMonthPrefix)) stats[r.discordId].month += 1;
@@ -254,13 +264,21 @@ function generateScheduleEmbed(reservations, isAdmin = false) {
     let futureRes = reservations.filter(res => res.status === 'approved' && res.timestamp >= now).sort((a, b) => a.timestamp - b.timestamp);
     if (!isAdmin) futureRes = futureRes.filter(res => res.date === todayStr);
 
+    const ITEMS_PER_PAGE = isCommand ? 8 : 30; // 互動指令一頁8筆，常駐看板顯示30筆
+    const totalItems = futureRes.length;
+    const totalPages = Math.max(1, Math.ceil(totalItems / ITEMS_PER_PAGE));
+    const p = Math.max(1, Math.min(page, totalPages));
+
     let scheduleText = '';
 
-    if (futureRes.length === 0) {
+    if (totalItems === 0) {
         scheduleText += isAdmin ? '目前沒有任何已通過的未來預約喔！\n\n' : '本日目前沒有已通過的預約喔！\n\n';
     } else {
+        const startIdx = (p - 1) * ITEMS_PER_PAGE;
+        const pageItems = futureRes.slice(startIdx, startIdx + ITEMS_PER_PAGE);
         const grouped = {};
-        futureRes.forEach(res => {
+        
+        pageItems.forEach(res => {
             if (!grouped[res.date]) grouped[res.date] = [];
             grouped[res.date].push(res);
         });
@@ -271,7 +289,6 @@ function generateScheduleEmbed(reservations, isAdmin = false) {
                 const noteText = res.notes && res.notes !== '無' ? ` | 備註：${res.notes}` : '';
                 let channelDisplay = '';
                 let playerInfo = '';
-                // 【名稱防呆優化】
                 const playerNameDisplay = res.discordName ? ` (${res.discordName})` : '';
                 
                 if (isAdmin) {
@@ -286,14 +303,22 @@ function generateScheduleEmbed(reservations, isAdmin = false) {
                 scheduleText += ` └─ ${playerInfo}${channelDisplay}${noteText}\n\n`;
             });
         }
+        
+        if (!isCommand && totalItems > ITEMS_PER_PAGE) {
+            scheduleText += `\n⚠️ **由於篇幅限制，看板僅顯示近期 ${ITEMS_PER_PAGE} 筆預約。**\n*(管理員可使用 \`/查詢預約\` 指令進行分頁檢視)*\n\n`;
+        }
     }
 
-    scheduleText += `🔄 **最後刷新時間**：\`${tw.yyyy}-${tw.mm}-${tw.dd} ${tw.hh}:${tw.min}\``;
+    if (!isCommand) {
+        scheduleText += `🔄 **最後刷新時間**：\`${tw.yyyy}-${tw.mm}-${tw.dd} ${tw.hh}:${tw.min}\``;
+    }
 
-    return new EmbedBuilder()
+    const embed = new EmbedBuilder()
         .setColor(isAdmin ? 0xFF0000 : 0x0099FF)
-        .setTitle(isAdmin ? '👑【管理員】王團自動排班表' : '👤 迴響預約清單')
+        .setTitle(isAdmin ? (isCommand ? `👑【管理員】王團自動排班表 (第 ${p}/${totalPages} 頁)` : '👑【管理員】王團自動排班表') : '👤 迴響預約清單')
         .setDescription(scheduleText);
+    
+    return { embed, totalPages, currentPage: p };
 }
 
 async function updateBoard() {
@@ -312,10 +337,12 @@ async function updateBoard() {
                 if (ch) {
                     const msg = await ch.messages.fetch(b.messageId).catch(() => null);
                     if (msg) {
-                        await msg.edit({ content: boardContent, embeds: [generateScheduleEmbed(reservations, false)], components: [reserveBtnRow] });
+                        const { embed } = generateScheduleEmbed(reservations, false, 1, false);
+                        await msg.edit({ content: boardContent, embeds: [embed], components: [reserveBtnRow] });
                         validPubList.push(b);
                     } else {
-                        const newMsg = await ch.send({ content: boardContent, embeds: [generateScheduleEmbed(reservations, false)], components: [reserveBtnRow] });
+                        const { embed } = generateScheduleEmbed(reservations, false, 1, false);
+                        const newMsg = await ch.send({ content: boardContent, embeds: [embed], components: [reserveBtnRow] });
                         validPubList.push({ channelId: ch.id, messageId: newMsg.id });
                         pubChanged = true;
                     }
@@ -336,10 +363,12 @@ async function updateBoard() {
                     const msg = await ch.messages.fetch(b.messageId).catch(() => null);
                     const tw = getTaiwanTime();
                     if (msg) {
-                        await msg.edit({ content: null, embeds: [generateScheduleEmbed(reservations, true)] });
+                        const { embed } = generateScheduleEmbed(reservations, true, 1, false);
+                        await msg.edit({ content: null, embeds: [embed] });
                         validAdmList.push(b);
                     } else {
-                        const newMsg = await ch.send({ embeds: [generateScheduleEmbed(reservations, true)] });
+                        const { embed } = generateScheduleEmbed(reservations, true, 1, false);
+                        const newMsg = await ch.send({ embeds: [embed] });
                         validAdmList.push({ channelId: ch.id, messageId: newMsg.id });
                         admChanged = true;
                     }
@@ -351,7 +380,6 @@ async function updateBoard() {
     } catch (e) { console.log('看板更新失敗', e); }
 }
 
-// 執行拒絕邏輯
 async function processRejection(docId, reason, reviewerId, interaction) {
     const docRef = db.collection('reservations').doc(docId);
     let data = allReservations.find(r => r.id === docId);
@@ -379,6 +407,7 @@ client.once('ready', async () => {
         { name: '預約', description: '開啟王團預約表單', options: [{ name: '地點', type: 3, description: '請選擇預約地點', required: true, choices: [ { name: '闇黑龍王', value: '闇黑龍王' }, { name: '艾畢奈亞', value: '艾畢奈亞' }, { name: '道館', value: '道館' }, { name: '其他', value: '其他' } ] }] },
         { name: '我的紀錄', description: '查詢個人的預約統計與排單狀態' },
         { name: '接單統計', description: '查詢各專員的接單與完成數量 (管理員)' },
+        { name: '查詢預約', description: '分頁檢視未來的完整預約清單 (管理員)' }, // 【新增指令】
         { name: '清理訊息', description: '批次清理頻道內的訊息 (管理員)', options: [{ name: '數量', type: 4, description: '要刪除的訊息數量 (1-100)', required: true }] },
         { name: '設定公開看板', description: '將此頻道加入或移除「公開看板區」' },
         { name: '設定管理看板', description: '將此頻道加入或移除「真實名單看板區」' },
@@ -394,13 +423,26 @@ client.once('ready', async () => {
                 { name: '清空凍結時段', type: 1, description: '清除所有已設定的凍結時段' },
                 { name: '查看目前設定', type: 1, description: '查看自動審核狀態與凍結時段' }
             ]
+        },
+        // 【新增指令：玩家管理】
+        {
+            name: '玩家管理',
+            description: '管理玩家的違規點數與封鎖狀態 (管理員)',
+            options: [
+                { name: '玩家', type: 6, description: '選擇目標玩家', required: true },
+                { name: '動作', type: 3, description: '執行的動作', required: true, choices: [
+                    { name: '解除封鎖 (解Ban)', value: 'unban' },
+                    { name: '清除違規點數 (歸零)', value: 'clear_points' },
+                    { name: '增加違規點數 (+1)', value: 'add_point' },
+                    { name: '扣除違規點數 (-1)', value: 'remove_point' }
+                ]}
+            ]
         }
     ];
     await client.application.commands.set(commands);
 
     setInterval(async () => {
         const now = Date.now();
-        
         try {
             const prices = appSettings['prices'] || {};
             const alarmLeadTime = appSettings['alarm']?.leadTime || 15;
@@ -425,7 +467,7 @@ client.once('ready', async () => {
                     let finalPriceStr = `${prices[data.location] || '未設定'}萬`;
                     const rule = vipRules[data.location];
                     if (rule && rule.buy > 0) {
-                        const userHistory = allReservations.filter(r => r.discordId === data.discordId && r.location === data.location && (r.status === 'approved' || r.status === 'completed')).sort((a, b) => a.timestamp - b.timestamp);
+                        const userHistory = allReservations.filter(r => r.discordId === data.discordId && r.location === data.location && (r.status === 'approved' || r.status === 'completed' || r.status === 'free')).sort((a, b) => a.timestamp - b.timestamp);
                         const orderIndex = userHistory.findIndex(r => r.id === data.id);
                         if (orderIndex !== -1) {
                             const cycle = rule.buy + rule.free;
@@ -464,6 +506,7 @@ client.once('ready', async () => {
                             const adminUser = await client.users.fetch(data.takenBy);
                             const row = new ActionRowBuilder().addComponents(
                                 new ButtonBuilder().setCustomId(`complete_${data.id}`).setLabel('⭕ 順利完成').setStyle(ButtonStyle.Success),
+                                new ButtonBuilder().setCustomId(`free_${data.id}`).setLabel('🎁 免單').setStyle(ButtonStyle.Primary),
                                 new ButtonBuilder().setCustomId(`fail_${data.id}`).setLabel('❌ 未完成/取消').setStyle(ButtonStyle.Danger)
                             );
                             await adminUser.send({ embeds: [new EmbedBuilder().setColor(0x8A2BE2).setTitle('⏱️ 訂單結案確認').setDescription(`**玩家**：<@${data.discordId}>\n**地點**：${data.location}\n**頻道**：${displayChannel}\n**預約時間**：\`${data.date} ${data.time}\`\n\n*請問順利完成了嗎？*`)], components: [row] });
@@ -514,7 +557,50 @@ client.on('interactionCreate', async interaction => {
 
             await interaction.deferReply({ ephemeral: true });
 
-            if (interaction.commandName === '營運設定') {
+            if (interaction.commandName === '玩家管理') {
+                if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.editReply({ content: '❌ 權限不足' });
+                const targetUser = interaction.options.getUser('玩家');
+                const action = interaction.options.getString('動作');
+                
+                const userRef = db.collection('users').doc(targetUser.id);
+                const userDoc = await userRef.get();
+                let ud = userDoc.exists ? userDoc.data() : { violationPoints: 0, bannedUntil: null };
+
+                if (action === 'unban') {
+                    ud.bannedUntil = null;
+                    await userRef.set(ud, { merge: true });
+                    return interaction.editReply(`✅ 已成功解除 <@${targetUser.id}> 的預約封鎖狀態！`);
+                } else if (action === 'clear_points') {
+                    ud.violationPoints = 0;
+                    await userRef.set(ud, { merge: true });
+                    return interaction.editReply(`✅ 已將 <@${targetUser.id}> 的違規點數清空歸零。`);
+                } else if (action === 'add_point') {
+                    ud.violationPoints = (ud.violationPoints || 0) + 1;
+                    if (ud.violationPoints >= 3) {
+                        ud.bannedUntil = Date.now() + 7 * 24 * 60 * 60 * 1000;
+                        ud.violationPoints = 0;
+                        await userRef.set(ud, { merge: true });
+                        return interaction.editReply(`✅ 已增加 <@${targetUser.id}> 的違規點數。目前達 3 點，已自動觸發封鎖 7 天！`);
+                    }
+                    await userRef.set(ud, { merge: true });
+                    return interaction.editReply(`✅ 已增加 <@${targetUser.id}> 的違規點數。目前累積：${ud.violationPoints} / 3 點。`);
+                } else if (action === 'remove_point') {
+                    ud.violationPoints = Math.max(0, (ud.violationPoints || 0) - 1);
+                    await userRef.set(ud, { merge: true });
+                    return interaction.editReply(`✅ 已扣除 <@${targetUser.id}> 的違規點數。目前累積：${ud.violationPoints} / 3 點。`);
+                }
+            }
+            else if (interaction.commandName === '查詢預約') {
+                if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.editReply({ content: '❌ 權限不足' });
+                const { embed, totalPages, currentPage } = generateScheduleEmbed(allReservations, true, 1, true);
+                
+                const navRow = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId('page_nav_prev_1').setLabel('◀ 上一頁').setStyle(ButtonStyle.Secondary).setDisabled(true),
+                    new ButtonBuilder().setCustomId('page_nav_next_2').setLabel('下一頁 ▶').setStyle(ButtonStyle.Secondary).setDisabled(totalPages <= 1)
+                );
+                return interaction.editReply({ embeds: [embed], components: [navRow] });
+            }
+            else if (interaction.commandName === '營運設定') {
                 if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.editReply({ content: '❌ 權限不足' });
                 const sub = interaction.options.getSubcommand();
                 const docRef = db.collection('settings').doc('operationMode');
@@ -631,7 +717,7 @@ client.on('interactionCreate', async interaction => {
                 const currentMonthPrefix = `${tw.yyyy}-${tw.mm}`;
                 let total = 0, month = 0;
                 allReservations.forEach(d => { 
-                    if (d.discordId === interaction.user.id && (d.status === 'approved' || d.status === 'completed')) {
+                    if (d.discordId === interaction.user.id && (d.status === 'approved' || d.status === 'completed' || d.status === 'free')) {
                         total++; 
                         if (d.date.startsWith(currentMonthPrefix)) month++; 
                     }
@@ -657,17 +743,40 @@ client.on('interactionCreate', async interaction => {
                 const currentMonthPrefix = `${tw.yyyy}-${tw.mm}`;
                 const stats = {};
                 allReservations.forEach(r => {
-                    if (r.takenBy && (r.status === 'completed' || r.status === 'failed')) {
-                        if (!stats[r.takenBy]) stats[r.takenBy] = { total: 0, month: 0, failed: 0 };
-                        if (r.status === 'completed') { stats[r.takenBy].total += 1; if (r.date.startsWith(currentMonthPrefix)) stats[r.takenBy].month += 1; } 
-                        else if (r.status === 'failed') { stats[r.takenBy].failed += 1; }
+                    if (r.takenBy && (r.status === 'completed' || r.status === 'failed' || r.status === 'free')) {
+                        if (!stats[r.takenBy]) stats[r.takenBy] = { total: 0, month: 0, totalFree: 0, monthFree: 0, failed: 0 };
+                        if (r.status === 'completed') { 
+                            stats[r.takenBy].total += 1; 
+                            if (r.date.startsWith(currentMonthPrefix)) stats[r.takenBy].month += 1; 
+                        } 
+                        else if (r.status === 'free') {
+                            stats[r.takenBy].totalFree += 1;
+                            if (r.date.startsWith(currentMonthPrefix)) stats[r.takenBy].monthFree += 1; 
+                        }
+                        else if (r.status === 'failed') { 
+                            stats[r.takenBy].failed += 1; 
+                        }
                     }
                 });
                 if (Object.keys(stats).length === 0) return interaction.editReply({ content: '目前無專員結案紀錄喔！' });
                 let desc = '';
-                for (const [userId, s] of Object.entries(stats)) { desc += `**專員**：<@${userId}>\n> 本月完成：\`${s.month}\` 次\n> 歷史總完成：\`${s.total}\` 次\n> 失敗/取消數：\`${s.failed}\` 次\n\n`; }
+                for (const [userId, s] of Object.entries(stats)) { 
+                    desc += `**專員**：<@${userId}>\n> 本月完成：\`${s.month}\` 次 (總計 \`${s.total}\`)\n> 本月免單招待：\`${s.monthFree}\` 次 (總計 \`${s.totalFree}\`)\n> 失敗/取消數：\`${s.failed}\` 次\n\n`; 
+                }
                 await interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x00FF00).setTitle('📊 迴響專員接單績效').setDescription(desc)] });
             }
+        }
+
+        else if (interaction.isButton() && interaction.customId.startsWith('page_nav_')) {
+            await interaction.deferUpdate();
+            const targetPage = parseInt(interaction.customId.split('_')[3]);
+            const { embed, totalPages, currentPage } = generateScheduleEmbed(allReservations, true, targetPage, true);
+            
+            const navRow = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId(`page_nav_prev_${currentPage - 1}`).setLabel('◀ 上一頁').setStyle(ButtonStyle.Secondary).setDisabled(currentPage <= 1),
+                new ButtonBuilder().setCustomId(`page_nav_next_${currentPage + 1}`).setLabel('下一頁 ▶').setStyle(ButtonStyle.Secondary).setDisabled(currentPage >= totalPages)
+            );
+            await interaction.editReply({ embeds: [embed], components: [navRow] });
         }
 
         else if (interaction.isButton() && interaction.customId === 'btn_reserve') {
@@ -724,7 +833,6 @@ client.on('interactionCreate', async interaction => {
                 return interaction.editReply({ content: `❌ **系統凍結時段**：此時段（${time}）暫不開放預約，請選擇其他時間喔！` });
             }
 
-            // 【名稱防呆優化儲存】強制紀錄使用者的 Discord 顯示名稱
             const data = {
                 discordId: interaction.user.id, 
                 discordName: interaction.user.displayName || interaction.user.username,
@@ -828,9 +936,37 @@ client.on('interactionCreate', async interaction => {
             await interaction.deferUpdate();
 
             const docRef = db.collection('reservations').doc(docId);
+
+            // 【防呆併發】利用 Transaction 確保同時間只有一人能接單
+            if (action === 'takeOrder') {
+                try {
+                    await db.runTransaction(async (t) => {
+                        const doc = await t.get(docRef);
+                        if (!doc.exists) throw new Error('NOT_FOUND');
+                        const data = doc.data();
+                        if (data.takenBy) throw new Error('TAKEN'); // 如果已經有人接單，拋出錯誤終止
+                        
+                        t.update(docRef, { takenBy: interaction.user.id });
+                    });
+                    
+                    const latestDoc = await docRef.get();
+                    const data = { id: latestDoc.id, ...latestDoc.data() };
+                    const payload = buildTicketPayload(docId, data);
+                    await syncManagementMessages(data.ticketMsgs, payload.embeds[0], payload.components);
+                    return interaction.followUp({ content: '✅ 成功接單！', ephemeral: true });
+                    
+                } catch (error) {
+                    if (error.message === 'TAKEN') {
+                        return interaction.followUp({ content: '❌ 慢了一步，已經被其他人接走囉！', ephemeral: true });
+                    }
+                    return interaction.followUp({ content: '❌ 找不到訂單或發生錯誤。', ephemeral: true });
+                }
+            }
+
             const doc = await docRef.get();
             if (!doc.exists) return interaction.followUp({ content: '❌ 找不到此訂單（可能已被刪除）。', ephemeral: true });
             let data = doc.data();
+            data.id = doc.id;
 
             if (action === 'approve') {
                 if (data.status !== 'pending') return interaction.followUp({ content: '❌ 訂單已處理過囉！', ephemeral: true });
@@ -851,21 +987,33 @@ client.on('interactionCreate', async interaction => {
                 return;
             }
 
-            if (action === 'takeOrder') {
-                if (data.takenBy) return interaction.followUp({ content: '❌ 已經被接走囉！', ephemeral: true });
-                data.takenBy = interaction.user.id;
-                await docRef.update({ takenBy: data.takenBy });
+            // 【新增邏輯】轉單釋出
+            if (action === 'release') {
+                if (data.takenBy !== interaction.user.id) {
+                    return interaction.followUp({ content: '❌ 只有目前的接單專員可以釋出此訂單！', ephemeral: true });
+                }
+                data.takenBy = null;
+                await docRef.update({ takenBy: null });
                 
                 const payload = buildTicketPayload(docId, data);
-                await syncManagementMessages(data.ticketMsgs, payload.embeds[0], payload.components);
-                return;
+                const newRefs = await bumpManagementMessages(data.ticketMsgs, payload.embeds[0], payload.components);
+                await docRef.update({ ticketMsgs: newRefs });
+                return interaction.followUp({ content: '✅ 已成功釋出訂單，等待其他專員接手。', ephemeral: true });
             }
 
-            if (action === 'complete' || action === 'fail') {
-                if (data.status === 'completed' || data.status === 'failed') return interaction.followUp({ content: '❌ 已經結案過了！', ephemeral: true });
-                if (data.takenBy && data.takenBy !== interaction.user.id) return interaction.followUp({ content: `❌ 只有專員 <@${data.takenBy}> 才能確認結案！`, ephemeral: true });
+            // 【整合更新】順利完成、免單、失敗
+            if (action === 'complete' || action === 'fail' || action === 'free') {
+                if (data.status === 'completed' || data.status === 'failed' || data.status === 'free') {
+                    return interaction.followUp({ content: '❌ 已經結案過了！', ephemeral: true });
+                }
+                if (data.takenBy && data.takenBy !== interaction.user.id) {
+                    return interaction.followUp({ content: `❌ 只有專員 <@${data.takenBy}> 才能確認結案！`, ephemeral: true });
+                }
 
-                data.status = action === 'complete' ? 'completed' : 'failed';
+                if (action === 'complete') data.status = 'completed';
+                else if (action === 'free') data.status = 'free';
+                else data.status = 'failed';
+
                 data.closer = interaction.user.id;
                 if (!data.takenBy) data.takenBy = interaction.user.id;
 
@@ -879,6 +1027,10 @@ client.on('interactionCreate', async interaction => {
                     const blessingEmbed = new EmbedBuilder().setColor(0xFFD700).setTitle('🎊 【訂單圓滿完成】')
                         .setDescription(`**地點**：${data.location}\n**時間**：${data.date} ${data.time}\n\n感謝您的惠顧！\n祝您這趟王團 **寶物大豐收、掉寶順利** 🍀\n期待下次再為您服務喔～`);
                     await editUserDM(data.discordId, data.userDmMsgId, { embeds: [blessingEmbed], components: [] });
+                } else if (action === 'free') {
+                    const freeEmbed = new EmbedBuilder().setColor(0xFFD700).setTitle('🎁 【專員招待！本次免單】')
+                        .setDescription(`**地點**：${data.location}\n**時間**：${data.date} ${data.time}\n\n專員為您標記了本次服務為 **免單招待**！🎉\n祝您武運昌隆，期待下次再見！`);
+                    await editUserDM(data.discordId, data.userDmMsgId, { embeds: [freeEmbed], components: [] });
                 }
 
                 updateBoard();
@@ -958,7 +1110,6 @@ client.on('interactionCreate', async interaction => {
                 else replyText += `\n💡 **溫馨小提醒**：距離原本開打不到 30 分鐘更改時間，已記錄一次臨時調整（目前：${points}/3）。`;
             }
 
-            // 【名稱防呆優化儲存】
             data.discordName = interaction.user.displayName || interaction.user.username;
             data.date = newDate; data.time = newTime; data.gameId = newGameId; data.channel = newChannel; data.notes = newNotes;
             data.timestamp = newDateTime.getTime(); 
