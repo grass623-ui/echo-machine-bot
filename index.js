@@ -205,8 +205,13 @@ function buildTicketPayload(docId, data) {
         if (data.status === 'approved') {
             if (!data.reminded) {
                 embed.setColor(0x00FF00).setTitle('🟢 訂單已排程');
-                timeline += `> ⏳ 等待鬧鐘發送...\n`;
-                if (data.takenBy) { 
+                if (!data.takenBy) {
+                    timeline += `> 🟡 審核通過，開放專員提前接單！\n`;
+                    timeline += `> ⏳ 等待鬧鐘發送...\n`;
+                    row.addComponents(new ButtonBuilder().setCustomId(`takeOrder_${docId}`).setLabel('✋ 我來接單').setStyle(ButtonStyle.Primary));
+                } else {
+                    timeline += `> ✅ 專員接單 (專員：<@${data.takenBy}>)\n`;
+                    timeline += `> ⏳ 等待鬧鐘發送...\n`;
                     row.addComponents(new ButtonBuilder().setCustomId(`release_${docId}`).setLabel('🔄 釋出轉單').setStyle(ButtonStyle.Secondary));
                 }
             } else if (data.reminded && !data.postChecked) {
