@@ -7,6 +7,13 @@ const {
 } = require('discord.js');
 
 // ==========================================
+// 0. 授權伺服器白名單設定
+// ==========================================
+// 將允許使用機器人的「伺服器 ID」以字串填入陣列。
+// 若保持空陣列 []，則代表不限制任何伺服器。
+const ALLOWED_GUILDS = []; 
+
+// ==========================================
 // 1. 初始化 Firebase 資料庫
 // ==========================================
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
@@ -101,6 +108,13 @@ async function addViolation(discordId) {
     return { points, bannedUntil };
 }
 
+async function checkIsAgent(userId, member) {
+    if (member && member.permissions.has(PermissionsBitField.Flags.Administrator)) return true;
+    const doc = await db.collection('users').doc(userId).get();
+    if (doc.exists && doc.data().isAgent === true) return true;
+    return false;
+}
+
 async function broadcastToManagementAreas(payload) {
     const doc = appSettings['managementArea'];
     if (!doc) return [];
@@ -162,7 +176,8 @@ function buildTicketPayload(docId, data) {
     let row = new ActionRowBuilder();
 
     const playerNameDisplay = data.discordName ? ` (${data.discordName})` : '';
-    const baseDesc = `**玩家**：<@${data.discordId}>${playerNameDisplay} (遊戲ID: ${data.gameId})\n**地點**：${data.location}\n**頻道**：${data.channel || '-'}\n**預約時間**：\`${data.date} ${data.time}\`\n**備註**：${data.notes || '無'}\n\n**📋 訂單時間線**：\n`;
+    // 新增：顯示單號，方便管理員複製
+    const baseDesc = `**單號**：\`${docId}\`\n**玩家**：<@${data.discordId}>${playerNameDisplay} (遊戲ID: ${data.gameId})\n**地點**：${data.location}\n**頻道**：${data.channel || '-'}\n**預約時間**：\`${data.date} ${data.time}\`\n**備註**：${data.notes || '無'}\n\n**📋 訂單時間線**：\n`;
     let timeline = '';
 
     if (data.status === 'pending') {
@@ -189,7 +204,7 @@ function buildTicketPayload(docId, data) {
             if (!data.reminded) {
                 embed.setColor(0x00FF00).setTitle('🟢 訂單已排程');
                 timeline += `> ⏳ 等待鬧鐘發送...\n`;
-                if (data.takenBy) { // 已提早接單，提供轉單
+                if (data.takenBy) { 
                     row.addComponents(new ButtonBuilder().setCustomId(`release_${docId}`).setLabel('🔄 釋出轉單').setStyle(ButtonStyle.Secondary));
                 }
             } else if (data.reminded && !data.postChecked) {
@@ -246,7 +261,6 @@ function buildTicketPayload(docId, data) {
     return { embeds: [embed], components };
 }
 
-// 【升級】引入分頁機制，防範超過 Discord Embed 6000字元限制
 function generateScheduleEmbed(reservations, isAdmin = false, page = 1, isCommand = false) {
     const now = Date.now();
     const tw = getTaiwanTime();
@@ -264,7 +278,7 @@ function generateScheduleEmbed(reservations, isAdmin = false, page = 1, isComman
     let futureRes = reservations.filter(res => res.status === 'approved' && res.timestamp >= now).sort((a, b) => a.timestamp - b.timestamp);
     if (!isAdmin) futureRes = futureRes.filter(res => res.date === todayStr);
 
-    const ITEMS_PER_PAGE = isCommand ? 8 : 30; // 互動指令一頁8筆，常駐看板顯示30筆
+    const ITEMS_PER_PAGE = isCommand ? 8 : 30; 
     const totalItems = futureRes.length;
     const totalPages = Math.max(1, Math.ceil(totalItems / ITEMS_PER_PAGE));
     const p = Math.max(1, Math.min(page, totalPages));
@@ -406,8 +420,9 @@ client.once('ready', async () => {
     const commands = [
         { name: '預約', description: '開啟王團預約表單', options: [{ name: '地點', type: 3, description: '請選擇預約地點', required: true, choices: [ { name: '闇黑龍王', value: '闇黑龍王' }, { name: '艾畢奈亞', value: '艾畢奈亞' }, { name: '道館', value: '道館' }, { name: '其他', value: '其他' } ] }] },
         { name: '我的紀錄', description: '查詢個人的預約統計與排單狀態' },
-        { name: '接單統計', description: '查詢各專員的接單與完成數量 (管理員)' },
-        { name: '查詢預約', description: '分頁檢視未來的完整預約清單 (管理員)' }, // 【新增指令】
+        { name: '接單統計', description: '查詢各專員的接單與完成數量 (管理員/專員)' },
+        { name: '查詢預約', description: '分頁檢視未來的完整預約清單 (管理員)' },
+        { name: '迴響機', description: '申請註冊成為專屬迴響專員 (需管理員審核)' },
         { name: '清理訊息', description: '批次清理頻道內的訊息 (管理員)', options: [{ name: '數量', type: 4, description: '要刪除的訊息數量 (1-100)', required: true }] },
         { name: '設定公開看板', description: '將此頻道加入或移除「公開看板區」' },
         { name: '設定管理看板', description: '將此頻道加入或移除「真實名單看板區」' },
@@ -424,7 +439,6 @@ client.once('ready', async () => {
                 { name: '查看目前設定', type: 1, description: '查看自動審核狀態與凍結時段' }
             ]
         },
-        // 【新增指令：玩家管理】
         {
             name: '玩家管理',
             description: '管理玩家的違規點數與封鎖狀態 (管理員)',
@@ -436,6 +450,14 @@ client.once('ready', async () => {
                     { name: '增加違規點數 (+1)', value: 'add_point' },
                     { name: '扣除違規點數 (-1)', value: 'remove_point' }
                 ]}
+            ]
+        },
+        {
+            name: '刪除訂單',
+            description: '列出近期歷史訂單以供刪除 (管理員)',
+            options: [
+                { name: '玩家', type: 6, description: '選擇玩家以縮小搜尋範圍 (選填)', required: false },
+                { name: '訂單id', type: 3, description: '直接輸入訂單 ID 進行單獨刪除 (選填)', required: false }
             ]
         }
     ];
@@ -540,6 +562,16 @@ client.once('ready', async () => {
 
 client.on('interactionCreate', async interaction => {
     try {
+        // ==========================================
+        // 伺服器白名單檢查
+        // ==========================================
+        if (interaction.guildId && ALLOWED_GUILDS.length > 0 && !ALLOWED_GUILDS.includes(interaction.guildId)) {
+            if (interaction.isRepliable()) {
+                return interaction.reply({ content: '❌ 此伺服器尚未開通迴響機器人服務。', ephemeral: true }).catch(() => {});
+            }
+            return;
+        }
+
         if (interaction.isChatInputCommand()) {
             if (interaction.commandName === '預約') {
                 const location = interaction.options.getString('地點');
@@ -557,7 +589,108 @@ client.on('interactionCreate', async interaction => {
 
             await interaction.deferReply({ ephemeral: true });
 
-            if (interaction.commandName === '玩家管理') {
+            if (interaction.commandName === '迴響機') {
+                const userRef = db.collection('users').doc(interaction.user.id);
+                const userDoc = await userRef.get();
+                let ud = userDoc.exists ? userDoc.data() : { violationPoints: 0, bannedUntil: null };
+                
+                if (ud.isAgent) {
+                    return interaction.editReply('✅ 您已經是認證的迴響專員囉！可以開始接單服務了。');
+                }
+                if (ud.agentStatus === 'pending') {
+                    return interaction.editReply('⏳ 您的專員申請正在審核中，請耐心等候管理員通知！');
+                }
+
+                ud.agentStatus = 'pending';
+                await userRef.set(ud, { merge: true });
+
+                const payload = {
+                    embeds: [new EmbedBuilder().setColor(0xFFA500).setTitle('📝 新專員認證申請')
+                        .setDescription(`玩家 <@${interaction.user.id}> 申請註冊成為 **迴響專員**！\n請審核是否賦予接單權限：`)],
+                    components: [new ActionRowBuilder().addComponents(
+                        new ButtonBuilder().setCustomId(`approveAgent_${interaction.user.id}`).setLabel('✅ 通過認證').setStyle(ButtonStyle.Success),
+                        new ButtonBuilder().setCustomId(`rejectAgent_${interaction.user.id}`).setLabel('❌ 拒絕申請').setStyle(ButtonStyle.Danger)
+                    )]
+                };
+                await broadcastToManagementAreas(payload);
+                return interaction.editReply('✅ **申請已送出！** 請等待管理員進行審核，審核結果將會私訊通知您。');
+            }
+            else if (interaction.commandName === '刪除訂單') {
+                if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.editReply({ content: '❌ 權限不足' });
+                
+                const targetUser = interaction.options.getUser('玩家');
+                const targetId = interaction.options.getString('訂單id');
+
+                // 模式一：直接刪除 ID
+                if (targetId) {
+                    const docId = targetId.trim();
+                    const targetOrder = allReservations.find(r => r.id === docId);
+                    
+                    if (!targetOrder) return interaction.editReply({ content: `❌ 找不到 ID 為 \`${docId}\` 的訂單。` });
+
+                    await db.collection('reservations').doc(docId).delete();
+                    if (targetOrder.ticketMsgs) {
+                        for (const m of targetOrder.ticketMsgs) {
+                            try {
+                                const ch = await client.channels.fetch(m.channelId).catch(() => null);
+                                if (ch) {
+                                    const msg = await ch.messages.fetch(m.messageId).catch(() => null);
+                                    if (msg) await msg.delete().catch(() => null);
+                                }
+                            } catch (e) {}
+                        }
+                    }
+                    setTimeout(() => { updateBoard(); }, 1500); 
+                    return interaction.editReply({ content: `✅ 已成功從資料庫徹底刪除訂單 \`${docId}\`！` });
+                }
+
+                // 模式二：拉出近期清單供選擇
+                let userOrders = [];
+                let displayMsg = '';
+                
+                if (targetUser) {
+                    userOrders = allReservations
+                        .filter(r => r.discordId === targetUser.id)
+                        .sort((a, b) => b.timestamp - a.timestamp)
+                        .slice(0, 25);
+                    displayMsg = `🗑️ **刪除訂單系統**\n請在下方選擇要刪除 <@${targetUser.id}> 的歷史訂單：`;
+                } else {
+                    userOrders = allReservations
+                        .sort((a, b) => b.timestamp - a.timestamp)
+                        .slice(0, 25);
+                    displayMsg = `🗑️ **刪除訂單系統 (近期所有紀錄)**\n請在下方選擇要刪除的歷史訂單：`;
+                }
+
+                if (userOrders.length === 0) return interaction.editReply({ content: `❌ 目前沒有找到任何訂單紀錄。` });
+
+                const options = userOrders.map(o => {
+                    let statusTw = '其他';
+                    if (o.status === 'approved') statusTw = '排程中';
+                    if (o.status === 'completed') statusTw = '完成';
+                    if (o.status === 'free') statusTw = '免單';
+                    if (o.status === 'failed') statusTw = '失敗';
+                    if (o.status === 'canceled') statusTw = '取消';
+                    if (o.status === 'pending') statusTw = '待審核';
+                    if (o.status === 'rejected') statusTw = '已拒絕';
+                    if (o.status === 'expired') statusTw = '過期';
+
+                    const pName = o.discordName ? o.discordName.substring(0, 6) : '未知';
+                    return {
+                        label: `[${o.date}] ${o.location} - 玩家:${pName}`,
+                        description: `狀態: ${statusTw} | ID: ${o.id}`,
+                        value: o.id
+                    };
+                });
+
+                const row = new ActionRowBuilder().addComponents(
+                    new StringSelectMenuBuilder()
+                        .setCustomId('select_delete_order')
+                        .setPlaceholder('請選擇要從資料庫徹底刪除的訂單')
+                        .addOptions(options)
+                );
+                return interaction.editReply({ content: `${displayMsg}\n*(注意：刪除後將無法恢復，並會自動修正報表統計)*`, components: [row] });
+            }
+            else if (interaction.commandName === '玩家管理') {
                 if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.editReply({ content: '❌ 權限不足' });
                 const targetUser = interaction.options.getUser('玩家');
                 const action = interaction.options.getString('動作');
@@ -738,7 +871,9 @@ client.on('interactionCreate', async interaction => {
                 await interaction.editReply({ embeds: [statEmbed] });
             }
             else if (interaction.commandName === '接單統計') {
-                if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.editReply({ content: '❌ 權限不足' });
+                const isAuthorized = await checkIsAgent(interaction.user.id, interaction.member);
+                if (!isAuthorized) return interaction.editReply({ content: '❌ 權限不足，僅限管理員或專員查詢喔！' });
+
                 const tw = getTaiwanTime();
                 const currentMonthPrefix = `${tw.yyyy}-${tw.mm}`;
                 const stats = {};
@@ -803,6 +938,29 @@ client.on('interactionCreate', async interaction => {
                 new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('notes').setLabel("備註").setStyle(TextInputStyle.Short).setRequired(false))
             );
             await interaction.showModal(modal);
+        }
+
+        else if (interaction.isStringSelectMenu() && interaction.customId === 'select_delete_order') {
+            await interaction.deferUpdate();
+            const docId = interaction.values[0];
+            const targetOrder = allReservations.find(r => r.id === docId);
+            
+            await db.collection('reservations').doc(docId).delete();
+            
+            if (targetOrder && targetOrder.ticketMsgs) {
+                for (const m of targetOrder.ticketMsgs) {
+                    try {
+                        const ch = await client.channels.fetch(m.channelId).catch(() => null);
+                        if (ch) {
+                            const msg = await ch.messages.fetch(m.messageId).catch(() => null);
+                            if (msg) await msg.delete().catch(() => null);
+                        }
+                    } catch (e) {}
+                }
+            }
+            
+            setTimeout(() => { updateBoard(); }, 1500); 
+            return interaction.editReply({ content: `✅ 已成功從資料庫徹底刪除該筆訂單紀錄！`, components: [] });
         }
 
         else if (interaction.isModalSubmit() && interaction.customId.startsWith('reserve_')) {
@@ -895,6 +1053,28 @@ client.on('interactionCreate', async interaction => {
         else if (interaction.isButton()) {
             const [action, docId] = interaction.customId.split('_');
 
+            if (action === 'approveAgent') {
+                if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.reply({ content: '❌ 權限不足', ephemeral: true });
+                await db.collection('users').doc(docId).set({ isAgent: true, agentStatus: 'approved' }, { merge: true });
+                await interaction.message.edit({ embeds: [new EmbedBuilder().setColor(0x00FF00).setTitle('✅ 專員申請已通過').setDescription(`<@${docId}> 已正式成為認證專員 (審核者：<@${interaction.user.id}>)`)], components: [] });
+                try {
+                    const targetUser = await client.users.fetch(docId);
+                    await targetUser.send('🎉 **恭喜！管理員已通過您的申請，您現在正式成為【迴響專員】囉！**\n您可以開始至頻道接單了！');
+                } catch(e) {}
+                return interaction.reply({ content: '✅ 審核完成。', ephemeral: true });
+            }
+
+            if (action === 'rejectAgent') {
+                if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.reply({ content: '❌ 權限不足', ephemeral: true });
+                await db.collection('users').doc(docId).set({ isAgent: false, agentStatus: 'rejected' }, { merge: true });
+                await interaction.message.edit({ embeds: [new EmbedBuilder().setColor(0xFF0000).setTitle('❌ 專員申請已拒絕').setDescription(`<@${docId}> 的申請已被拒絕 (審核者：<@${interaction.user.id}>)`)], components: [] });
+                try {
+                    const targetUser = await client.users.fetch(docId);
+                    await targetUser.send('🚫 **抱歉，管理員退回了您的【迴響專員】申請。**');
+                } catch(e) {}
+                return interaction.reply({ content: '✅ 已拒絕。', ephemeral: true });
+            }
+
             if (action === 'edit') {
                 const docRef = db.collection('reservations').doc(docId);
                 const doc = await docRef.get();
@@ -937,14 +1117,18 @@ client.on('interactionCreate', async interaction => {
 
             const docRef = db.collection('reservations').doc(docId);
 
-            // 【防呆併發】利用 Transaction 確保同時間只有一人能接單
             if (action === 'takeOrder') {
+                const isAuthorized = await checkIsAgent(interaction.user.id, interaction.member);
+                if (!isAuthorized) {
+                    return interaction.followUp({ content: '❌ **權限不足！** 您尚未註冊成為「迴響專員」，請先使用 `/迴響機` 送出申請並等待審核。', ephemeral: true });
+                }
+
                 try {
                     await db.runTransaction(async (t) => {
                         const doc = await t.get(docRef);
                         if (!doc.exists) throw new Error('NOT_FOUND');
                         const data = doc.data();
-                        if (data.takenBy) throw new Error('TAKEN'); // 如果已經有人接單，拋出錯誤終止
+                        if (data.takenBy) throw new Error('TAKEN'); 
                         
                         t.update(docRef, { takenBy: interaction.user.id });
                     });
@@ -987,7 +1171,6 @@ client.on('interactionCreate', async interaction => {
                 return;
             }
 
-            // 【新增邏輯】轉單釋出
             if (action === 'release') {
                 if (data.takenBy !== interaction.user.id) {
                     return interaction.followUp({ content: '❌ 只有目前的接單專員可以釋出此訂單！', ephemeral: true });
@@ -1001,7 +1184,6 @@ client.on('interactionCreate', async interaction => {
                 return interaction.followUp({ content: '✅ 已成功釋出訂單，等待其他專員接手。', ephemeral: true });
             }
 
-            // 【整合更新】順利完成、免單、失敗
             if (action === 'complete' || action === 'fail' || action === 'free') {
                 if (data.status === 'completed' || data.status === 'failed' || data.status === 'free') {
                     return interaction.followUp({ content: '❌ 已經結案過了！', ephemeral: true });
