@@ -1496,4 +1496,7 @@ client.on('interactionCreate', async interaction => {
     }
 });
 
-client.login(process.env.DISCORD_TOKEN);
+client.login(process.env.DISCORD_TOKEN).catch(error => {
+    console.error('❌ [Discord 登入失敗]：');
+    console.error(error);
+});
