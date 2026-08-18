@@ -558,6 +558,8 @@ function buildAgentDetailsMessage(agentId, page) {
 
 client.once('ready', async () => {
     console.log(`[Bot] Logged in as ${client.user.tag}!`);
+    
+    // 💡 修正了營運設定中的 Boolean 型別衝突問題
     const commands = [
         { name: '預約', description: '開啟王團預約表單', options: [{ name: '地點', type: 3, description: '請選擇預約地點', required: true, choices: [ { name: '闇黑龍王', value: '闇黑龍王' }, { name: '艾畢奈亞', value: '艾畢奈亞' }, { name: '道館', value: '道館' }, { name: '其他', value: '其他' } ] }] },
         { name: '我的紀錄', description: '查詢個人的預約統計與排單狀態' },
@@ -580,15 +582,15 @@ client.once('ready', async () => {
                 { 
                     name: '自動審核', type: 1, description: '開啟或關閉自動審核', 
                     options: [{ 
-                        name: '狀態', type: 5, description: '是否開啟自動審核', required: true, 
-                        choices: [ { name: '開啟', value: true }, { name: '關閉', value: false } ] 
+                        name: '狀態', type: 3, description: '是否開啟自動審核', required: true, 
+                        choices: [ { name: '開啟', value: 'true' }, { name: '關閉', value: 'false' } ] 
                     }] 
                 },
                 { 
                     name: '自動更新看板', type: 1, description: '每分鐘自動刷新看板時間 (注意資源額度)', 
                     options: [{ 
-                        name: '狀態', type: 5, description: '是否開啟自動更新', required: true,
-                        choices: [ { name: '開啟', value: true }, { name: '關閉', value: false } ] 
+                        name: '狀態', type: 3, description: '是否開啟自動更新', required: true,
+                        choices: [ { name: '開啟', value: 'true' }, { name: '關閉', value: 'false' } ] 
                     }] 
                 },
                 { 
@@ -716,7 +718,6 @@ client.once('ready', async () => {
                 }
             }
             
-            // 💡 若開啟自動更新看板，則每分鐘執行刷新
             if (opMode.autoRefreshBoard === true) {
                 updateBoard();
             }
@@ -727,9 +728,6 @@ client.once('ready', async () => {
 
 client.on('interactionCreate', async interaction => {
     try {
-        // ==========================================
-        // 伺服器白名單檢查
-        // ==========================================
         if (interaction.guildId && ALLOWED_GUILDS.length > 0 && !ALLOWED_GUILDS.includes(interaction.guildId)) {
             if (interaction.isRepliable()) {
                 return interaction.reply({ content: '❌ 此伺服器尚未開通迴響機器人服務。', ephemeral: true }).catch(() => {});
@@ -928,13 +926,16 @@ client.on('interactionCreate', async interaction => {
                 const docRef = db.collection('settings').doc('operationMode');
                 let opData = appSettings['operationMode'] || { autoApprove: false, autoRefreshBoard: false, frozenSlots: [] };
 
+                // 💡 修正了從 string 解析 boolean 的邏輯
                 if (sub === '自動審核') {
-                    const state = interaction.options.getBoolean('狀態');
+                    const stateStr = interaction.options.getString('狀態');
+                    const state = stateStr === 'true';
                     opData.autoApprove = state;
                     await docRef.set(opData, { merge: true });
                     return interaction.editReply(`✅ 已將「自動審核」狀態設定為：**${state ? '🟢 開啟 (系統自動接單)' : '🔴 關閉 (維持人工審核)'}**`);
                 } else if (sub === '自動更新看板') {
-                    const state = interaction.options.getBoolean('狀態');
+                    const stateStr = interaction.options.getString('狀態');
+                    const state = stateStr === 'true';
                     opData.autoRefreshBoard = state;
                     await docRef.set(opData, { merge: true });
                     return interaction.editReply(`✅ 已將「自動更新看板」狀態設定為：**${state ? '🟢 開啟 (每分鐘自動刷新)' : '🔴 關閉 (全手動刷新，最省資源)'}**`);
@@ -1078,17 +1079,11 @@ client.on('interactionCreate', async interaction => {
             }
         }
 
-        // ==========================================
-        // 手動刷新看板按鈕
-        // ==========================================
         else if (interaction.isButton() && interaction.customId === 'btn_refresh_board') {
             await interaction.deferUpdate(); 
             await updateBoard(); 
         }
 
-        // ==========================================
-        // 專員統計面板 - 按鈕事件處理
-        // ==========================================
         else if (interaction.isButton() && (interaction.customId.startsWith('agent_nav_') || interaction.customId.startsWith('agent_details_'))) {
             await interaction.deferUpdate();
             const parts = interaction.customId.split('_');
@@ -1180,7 +1175,6 @@ client.on('interactionCreate', async interaction => {
         else if (interaction.isModalSubmit() && interaction.customId.startsWith('reserve_')) {
             await interaction.deferReply({ ephemeral: true });
             
-            // 💡 防呆：如果觸發這段的是一個暫時的選單訊息，就把它刪掉，不要誤刪公開看板
             if (interaction.message && interaction.message.flags.has(64)) {
                 await interaction.message.delete().catch(() => {});
             }
