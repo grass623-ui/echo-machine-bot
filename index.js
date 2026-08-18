@@ -421,12 +421,131 @@ async function processRejection(docId, reason, reviewerId, interaction) {
     await interaction.editReply({ content: '✅ 訂單已拒絕，並已通知玩家。', components: [] });
 }
 
+// ==========================================
+// 專員統計相關功能模組
+// ==========================================
+function calculateOrderPrice(order) {
+    const prices = appSettings['prices'] || {};
+    const vipRules = appSettings['vipRules'] || {};
+    
+    if (order.status === 'free') return 0;
+    if (order.status !== 'completed') return 0;
+
+    let price = prices[order.location] || 0;
+    const rule = vipRules[order.location];
+    if (rule && rule.buy > 0) {
+        const userHistory = allReservations
+            .filter(r => r.discordId === order.discordId && r.location === order.location && (r.status === 'approved' || r.status === 'completed' || r.status === 'free'))
+            .sort((a, b) => a.timestamp - b.timestamp);
+        const orderIndex = userHistory.findIndex(r => r.id === order.id);
+        if (orderIndex !== -1) {
+            const cycle = rule.buy + rule.free;
+            if ((orderIndex % cycle) >= rule.buy) price = 0; // VIP 免單
+        }
+    }
+    return price;
+}
+
+function buildAgentStatMessage(agentId) {
+    // 找出所有有接單過的人員名單
+    const agentIds = [...new Set(allReservations.filter(r => r.takenBy && (r.status === 'completed' || r.status === 'failed' || r.status === 'free')).map(r => r.takenBy))];
+    const currentIndex = agentIds.indexOf(agentId);
+    
+    const tw = getTaiwanTime();
+    const currentMonthPrefix = `${tw.yyyy}-${tw.mm}`;
+
+    let total = 0, month = 0, totalFree = 0, monthFree = 0, failed = 0;
+    let totalRevenue = 0, monthRevenue = 0;
+
+    allReservations.forEach(r => {
+        if (r.takenBy === agentId && (r.status === 'completed' || r.status === 'failed' || r.status === 'free')) {
+            const isCurrentMonth = r.date.startsWith(currentMonthPrefix);
+            
+            if (r.status === 'completed') {
+                total++;
+                if (isCurrentMonth) month++;
+                const price = calculateOrderPrice(r);
+                totalRevenue += price;
+                if (isCurrentMonth) monthRevenue += price;
+            } else if (r.status === 'free') {
+                totalFree++;
+                if (isCurrentMonth) monthFree++;
+            } else if (r.status === 'failed') {
+                failed++;
+            }
+        }
+    });
+
+    const embed = new EmbedBuilder()
+        .setColor(0x00FF00)
+        .setTitle(`📊 迴響專員接單績效 (${currentIndex + 1} / ${agentIds.length})`)
+        .setDescription(`**專員**：<@${agentId}>\n> 本月完成：\`${month}\` 次 (總計 \`${total}\`)\n> 本月免單招待：\`${monthFree}\` 次 (總計 \`${totalFree}\`)\n> 失敗/取消數：\`${failed}\` 次\n>\n> 💰 本月收益：\`${monthRevenue}\` 萬\n> 💰 總計收益：\`${totalRevenue}\` 萬`);
+
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`agent_nav_prev_${agentId}`).setLabel('◀ 上一位').setStyle(ButtonStyle.Secondary).setDisabled(currentIndex <= 0),
+        new ButtonBuilder().setCustomId(`agent_details_${agentId}_1`).setLabel('📋 查看訂單明細').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId(`agent_nav_next_${agentId}`).setLabel('下一位 ▶').setStyle(ButtonStyle.Secondary).setDisabled(currentIndex >= agentIds.length - 1 || currentIndex === -1)
+    );
+
+    return { embed, components: [row] };
+}
+
+function buildAgentDetailsMessage(agentId, page) {
+    const orders = allReservations
+        .filter(r => r.takenBy === agentId && (r.status === 'completed' || r.status === 'free' || r.status === 'failed'))
+        .sort((a, b) => b.timestamp - a.timestamp);
+
+    const ITEMS_PER_PAGE = 8;
+    const totalPages = Math.max(1, Math.ceil(orders.length / ITEMS_PER_PAGE));
+    const p = Math.max(1, Math.min(page, totalPages));
+
+    const startIdx = (p - 1) * ITEMS_PER_PAGE;
+    const pageItems = orders.slice(startIdx, startIdx + ITEMS_PER_PAGE);
+
+    let desc = `**專員**：<@${agentId}> 的歷史訂單紀錄\n\n`;
+    if (pageItems.length === 0) {
+        desc += "尚無訂單明細。";
+    } else {
+        pageItems.forEach(o => {
+            let statusIcon = '⭕';
+            let priceStr = '';
+            
+            if (o.status === 'completed') {
+                const pAmt = calculateOrderPrice(o);
+                priceStr = pAmt === 0 ? `(💎 VIP免單)` : `(${pAmt}萬)`;
+            } else if (o.status === 'free') {
+                statusIcon = '🎁';
+                priceStr = `(招待)`;
+            } else if (o.status === 'failed') {
+                statusIcon = '❌';
+                priceStr = `(失敗/取消)`;
+            }
+            
+            const pName = o.discordName ? o.discordName.substring(0, 8) : '未知';
+            desc += `\`${o.date} ${o.time}\` ${statusIcon} **${o.location}** ${priceStr}\n> 👤: ${pName} | 單號: ${o.id.substring(0,6)}\n`;
+        });
+    }
+
+    const embed = new EmbedBuilder()
+        .setColor(0x0099FF)
+        .setTitle(`📋 訂單明細 (第 ${p} / ${totalPages} 頁)`)
+        .setDescription(desc);
+
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`agent_details_${agentId}_${p - 1}`).setLabel('◀ 上一頁').setStyle(ButtonStyle.Secondary).setDisabled(p <= 1),
+        new ButtonBuilder().setCustomId(`agent_nav_curr_${agentId}`).setLabel('↩ 返回統計摘要').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`agent_details_${agentId}_${p + 1}`).setLabel('下一頁 ▶').setStyle(ButtonStyle.Secondary).setDisabled(p >= totalPages)
+    );
+
+    return { embed, components: [row] };
+}
+
 client.once('ready', async () => {
     console.log(`[Bot] Logged in as ${client.user.tag}!`);
     const commands = [
         { name: '預約', description: '開啟王團預約表單', options: [{ name: '地點', type: 3, description: '請選擇預約地點', required: true, choices: [ { name: '闇黑龍王', value: '闇黑龍王' }, { name: '艾畢奈亞', value: '艾畢奈亞' }, { name: '道館', value: '道館' }, { name: '其他', value: '其他' } ] }] },
         { name: '我的紀錄', description: '查詢個人的預約統計與排單狀態' },
-        { name: '接單統計', description: '查詢各專員的接單與完成數量 (管理員/專員)' },
+        { name: '接單統計', description: '查詢各專員的接單績效與收益 (管理員/專員)' },
         { name: '查詢預約', description: '分頁檢視未來的完整預約清單 (管理員)' },
         { name: '註冊迴響專員', description: '申請註冊成為專屬迴響專員 (需管理員審核)' },
         { name: '指定迴響專員', description: '直接指定玩家成為迴響專員 (管理員)', options: [{ name: '玩家', type: 6, description: '選擇目標玩家', required: true }] },
@@ -634,9 +753,7 @@ client.on('interactionCreate', async interaction => {
                 
                 try {
                     await targetUser.send('🎉 **恭喜！管理員已直接指定您為【迴響專員】囉！**\n您可以開始至頻道接單了！');
-                } catch (e) {
-                    // 若玩家關閉私訊，忽略錯誤
-                }
+                } catch (e) {}
                 
                 return interaction.editReply(`✅ 已成功指定 <@${targetUser.id}> 為迴響專員。`);
             }
@@ -904,31 +1021,45 @@ client.on('interactionCreate', async interaction => {
                 const isAuthorized = await checkIsAgent(interaction.user.id, interaction.member);
                 if (!isAuthorized) return interaction.editReply({ content: '❌ 權限不足，僅限管理員或專員查詢喔！' });
 
-                const tw = getTaiwanTime();
-                const currentMonthPrefix = `${tw.yyyy}-${tw.mm}`;
-                const stats = {};
-                allReservations.forEach(r => {
-                    if (r.takenBy && (r.status === 'completed' || r.status === 'failed' || r.status === 'free')) {
-                        if (!stats[r.takenBy]) stats[r.takenBy] = { total: 0, month: 0, totalFree: 0, monthFree: 0, failed: 0 };
-                        if (r.status === 'completed') { 
-                            stats[r.takenBy].total += 1; 
-                            if (r.date.startsWith(currentMonthPrefix)) stats[r.takenBy].month += 1; 
-                        } 
-                        else if (r.status === 'free') {
-                            stats[r.takenBy].totalFree += 1;
-                            if (r.date.startsWith(currentMonthPrefix)) stats[r.takenBy].monthFree += 1; 
-                        }
-                        else if (r.status === 'failed') { 
-                            stats[r.takenBy].failed += 1; 
-                        }
-                    }
-                });
-                if (Object.keys(stats).length === 0) return interaction.editReply({ content: '目前無專員結案紀錄喔！' });
-                let desc = '';
-                for (const [userId, s] of Object.entries(stats)) { 
-                    desc += `**專員**：<@${userId}>\n> 本月完成：\`${s.month}\` 次 (總計 \`${s.total}\`)\n> 本月免單招待：\`${s.monthFree}\` 次 (總計 \`${s.totalFree}\`)\n> 失敗/取消數：\`${s.failed}\` 次\n\n`; 
-                }
-                await interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x00FF00).setTitle('📊 迴響專員接單績效').setDescription(desc)] });
+                const agentIds = [...new Set(allReservations.filter(r => r.takenBy && (r.status === 'completed' || r.status === 'failed' || r.status === 'free')).map(r => r.takenBy))];
+                if (agentIds.length === 0) return interaction.editReply({ content: '目前無專員結案紀錄喔！' });
+
+                const { embed, components } = buildAgentStatMessage(agentIds[0]);
+                await interaction.editReply({ embeds: [embed], components });
+            }
+        }
+
+        // ==========================================
+        // 專員統計面板 - 按鈕事件處理
+        // ==========================================
+        else if (interaction.isButton() && (interaction.customId.startsWith('agent_nav_') || interaction.customId.startsWith('agent_details_'))) {
+            await interaction.deferUpdate();
+            const parts = interaction.customId.split('_');
+            const agentIds = [...new Set(allReservations.filter(r => r.takenBy && (r.status === 'completed' || r.status === 'failed' || r.status === 'free')).map(r => r.takenBy))];
+            
+            // 面板導覽：上一位、下一位、返回
+            if (interaction.customId.startsWith('agent_nav_')) {
+                const action = parts[2]; // prev, next, curr
+                const currentAgentId = parts[3];
+                let currIdx = agentIds.indexOf(currentAgentId);
+                
+                if (currIdx === -1) currIdx = 0; // 防呆
+                
+                if (action === 'prev') currIdx = Math.max(0, currIdx - 1);
+                if (action === 'next') currIdx = Math.min(agentIds.length - 1, currIdx + 1);
+                
+                const targetAgentId = agentIds[currIdx];
+                const { embed, components } = buildAgentStatMessage(targetAgentId);
+                return interaction.editReply({ embeds: [embed], components });
+            }
+            
+            // 查看明細 (切換頁數)
+            if (interaction.customId.startsWith('agent_details_')) {
+                const agentId = parts[2];
+                const page = parseInt(parts[3]);
+                
+                const { embed, components } = buildAgentDetailsMessage(agentId, page);
+                return interaction.editReply({ embeds: [embed], components });
             }
         }
 
