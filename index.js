@@ -54,7 +54,8 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBit
 
 const publicBoardIntro = "🎉 **歡迎來到迴響預約中心！**\n為了出團順暢，請提早預約您的專屬迴響時段。\n👇 請點擊下方 **【📝 預約迴響時間】** 快速排單，系統將會為您登記並通知審核！";
 const reserveBtnRow = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('btn_reserve').setLabel('📝 預約迴響時間').setStyle(ButtonStyle.Primary)
+    new ButtonBuilder().setCustomId('btn_reserve').setLabel('📝 預約迴響時間').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('btn_refresh_board').setLabel('🔄 手動刷新看板').setStyle(ButtonStyle.Secondary)
 );
 
 function getTaiwanTime() {
@@ -71,7 +72,7 @@ function getTaiwanTime() {
 
 function getBoardContentWithTime() {
     const tw = getTaiwanTime();
-    return `${publicBoardIntro}\n\n🔄 **最後刷新時間**：\`${tw.yyyy}-${tw.mm}-${tw.dd} ${tw.hh}:${tw.min}\``;
+    return `${publicBoardIntro}\n\n🔄 **最後刷新時間**：\`${tw.yyyy}-${tw.mm}-${tw.dd} ${tw.hh}:${tw.min}\`\n*(💡 若想確認最新排單，請點擊「手動刷新看板」)*`;
 }
 
 function isTimeFrozen(timeStr, frozenSlots) {
@@ -447,7 +448,6 @@ function calculateOrderPrice(order) {
 }
 
 function buildAgentStatMessage(agentId) {
-    // 找出所有有接單過的人員名單
     const agentIds = [...new Set(allReservations.filter(r => r.takenBy && (r.status === 'completed' || r.status === 'failed' || r.status === 'free')).map(r => r.takenBy))];
     const currentIndex = agentIds.indexOf(agentId);
     
@@ -547,6 +547,7 @@ client.once('ready', async () => {
         { name: '我的紀錄', description: '查詢個人的預約統計與排單狀態' },
         { name: '接單統計', description: '查詢各專員的接單績效與收益 (管理員/專員)' },
         { name: '查詢預約', description: '分頁檢視未來的完整預約清單 (管理員)' },
+        { name: '刷新看板', description: '強制手動刷新所有預約看板 (管理員)' },
         { name: '註冊迴響專員', description: '申請註冊成為專屬迴響專員 (需管理員審核)' },
         { name: '指定迴響專員', description: '直接指定玩家成為迴響專員 (管理員)', options: [{ name: '玩家', type: 6, description: '選擇目標玩家', required: true }] },
         { name: '刪除迴響專員', description: '移除玩家的迴響專員身分 (管理員)', options: [{ name: '玩家', type: 6, description: '選擇要移除身分的玩家', required: true }] },
@@ -681,7 +682,7 @@ client.once('ready', async () => {
                     await syncManagementMessages(data.ticketMsgs, payload.embeds[0], payload.components);
                 }
             }
-            updateBoard();
+            // 💡 已移除這裡的 updateBoard(); 防止每分鐘的自動更新吃掉請求配額
             
         } catch (error) { console.error(error); }
     }, 60 * 1000); 
@@ -716,7 +717,12 @@ client.on('interactionCreate', async interaction => {
 
             await interaction.deferReply({ ephemeral: true });
 
-            if (interaction.commandName === '註冊迴響專員') {
+            if (interaction.commandName === '刷新看板') {
+                if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.editReply({ content: '❌ 權限不足' });
+                await updateBoard();
+                return interaction.editReply({ content: '✅ 所有預約看板已手動強制刷新完畢！' });
+            }
+            else if (interaction.commandName === '註冊迴響專員') {
                 const userRef = db.collection('users').doc(interaction.user.id);
                 const userDoc = await userRef.get();
                 let ud = userDoc.exists ? userDoc.data() : { violationPoints: 0, bannedUntil: null };
@@ -788,7 +794,6 @@ client.on('interactionCreate', async interaction => {
                             } catch (e) {}
                         }
                     }
-                    setTimeout(() => { updateBoard(); }, 1500); 
                     return interaction.editReply({ content: `✅ 已成功從資料庫徹底刪除訂單 \`${docId}\`！` });
                 }
 
@@ -1030,6 +1035,14 @@ client.on('interactionCreate', async interaction => {
         }
 
         // ==========================================
+        // 手動刷新看板按鈕
+        // ==========================================
+        else if (interaction.isButton() && interaction.customId === 'btn_refresh_board') {
+            await interaction.deferUpdate(); 
+            await updateBoard(); 
+        }
+
+        // ==========================================
         // 專員統計面板 - 按鈕事件處理
         // ==========================================
         else if (interaction.isButton() && (interaction.customId.startsWith('agent_nav_') || interaction.customId.startsWith('agent_details_'))) {
@@ -1037,13 +1050,12 @@ client.on('interactionCreate', async interaction => {
             const parts = interaction.customId.split('_');
             const agentIds = [...new Set(allReservations.filter(r => r.takenBy && (r.status === 'completed' || r.status === 'failed' || r.status === 'free')).map(r => r.takenBy))];
             
-            // 面板導覽：上一位、下一位、返回
             if (interaction.customId.startsWith('agent_nav_')) {
-                const action = parts[2]; // prev, next, curr
+                const action = parts[2]; 
                 const currentAgentId = parts[3];
                 let currIdx = agentIds.indexOf(currentAgentId);
                 
-                if (currIdx === -1) currIdx = 0; // 防呆
+                if (currIdx === -1) currIdx = 0; 
                 
                 if (action === 'prev') currIdx = Math.max(0, currIdx - 1);
                 if (action === 'next') currIdx = Math.min(agentIds.length - 1, currIdx + 1);
@@ -1053,7 +1065,6 @@ client.on('interactionCreate', async interaction => {
                 return interaction.editReply({ embeds: [embed], components });
             }
             
-            // 查看明細 (切換頁數)
             if (interaction.customId.startsWith('agent_details_')) {
                 const agentId = parts[2];
                 const page = parseInt(parts[3]);
@@ -1119,8 +1130,6 @@ client.on('interactionCreate', async interaction => {
                     } catch (e) {}
                 }
             }
-            
-            setTimeout(() => { updateBoard(); }, 1500); 
             return interaction.editReply({ content: `✅ 已成功從資料庫徹底刪除該筆訂單紀錄！`, components: [] });
         }
 
@@ -1182,7 +1191,6 @@ client.on('interactionCreate', async interaction => {
                 } catch (error) {
                     await interaction.editReply({ content: `✅ 預約成功！系統已自動通過。\n⚠️ **請開啟接收私訊功能！**` });
                 }
-                updateBoard();
             } else {
                 const dmEmbed = new EmbedBuilder().setColor(0xFFA500).setTitle('⏳ 預約等待審核中').setDescription(`您的訂單已送出，等待管理員審核通過後才會加入排班表喔！\n**地點**：${location}\n**時間**：${date} ${time}`);
                 try {
@@ -1237,10 +1245,9 @@ client.on('interactionCreate', async interaction => {
             }
 
             if (action === 'edit') {
-                const docRef = db.collection('reservations').doc(docId);
-                const doc = await docRef.get();
-                if (!doc.exists) return interaction.reply({ content: '❌ 找不到此訂單。', ephemeral: true });
-                const data = doc.data();
+                // 🔴 修正：不再從 Firebase `get()`，改從全域記憶體秒拿，確保不會超時
+                const data = allReservations.find(r => r.id === docId);
+                if (!data) return interaction.reply({ content: '❌ 找不到此訂單。', ephemeral: true });
                 
                 const modal = new ModalBuilder().setCustomId(`submitEdit_${docId}`).setTitle('變更登記資料');
                 const channelInput = new TextInputBuilder().setCustomId('channel').setLabel("幸運頻道").setStyle(TextInputStyle.Short).setRequired(false);
@@ -1255,7 +1262,7 @@ client.on('interactionCreate', async interaction => {
                     new ActionRowBuilder().addComponents(channelInput),
                     new ActionRowBuilder().addComponents(notesInput)
                 );
-                return interaction.showModal(modal);
+                return interaction.showModal(modal); // 保證 3 秒內完成顯示！
             }
 
             if (action === 'reject') {
@@ -1328,7 +1335,6 @@ client.on('interactionCreate', async interaction => {
                     new ButtonBuilder().setCustomId(`cancel_${docId}`).setLabel('🗑️ 取消預約').setStyle(ButtonStyle.Danger)
                 );
                 await editUserDM(data.discordId, data.userDmMsgId, { embeds: [dmEmbed], components: [btnRow] });
-                updateBoard();
                 return;
             }
 
@@ -1378,8 +1384,6 @@ client.on('interactionCreate', async interaction => {
                         .setDescription(`**地點**：${data.location}\n**時間**：${data.date} ${data.time}\n\n專員為您標記了本次服務為 **免單招待**！🎉\n祝您武運昌隆，期待下次再見！`);
                     await editUserDM(data.discordId, data.userDmMsgId, { embeds: [freeEmbed], components: [] });
                 }
-
-                updateBoard();
                 return;
             }
 
@@ -1403,7 +1407,6 @@ client.on('interactionCreate', async interaction => {
                 }
                 await interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFF0000).setTitle('🚫 訂單已取消').setDescription(`**地點**：${data.location}\n**時間**：${data.date} ${data.time}`)], components: [] });
                 await interaction.followUp({ content: replyText, ephemeral: true });
-                updateBoard();
             }
         }
 
@@ -1481,8 +1484,6 @@ client.on('interactionCreate', async interaction => {
                 new ButtonBuilder().setCustomId(`cancel_${docId}`).setLabel('🗑️ 取消預約').setStyle(ButtonStyle.Danger)
             );
             await interaction.editReply({ embeds: [dmEmbed], components: [btnRow] });
-
-            updateBoard();
         }
 
     } catch (error) {
