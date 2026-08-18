@@ -441,7 +441,7 @@ function calculateOrderPrice(order) {
         const orderIndex = userHistory.findIndex(r => r.id === order.id);
         if (orderIndex !== -1) {
             const cycle = rule.buy + rule.free;
-            if ((orderIndex % cycle) >= rule.buy) price = 0; // VIP 免單
+            if ((orderIndex % cycle) >= rule.buy) price = 0; 
         }
     }
     return price;
@@ -534,7 +534,7 @@ function buildAgentDetailsMessage(agentId, page) {
     const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`agent_details_${agentId}_${p - 1}`).setLabel('◀ 上一頁').setStyle(ButtonStyle.Secondary).setDisabled(p <= 1),
         new ButtonBuilder().setCustomId(`agent_nav_curr_${agentId}`).setLabel('↩ 返回統計摘要').setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId(`agent_details_${agentId}_${p + 1}`).setLabel('下一頁 ▶').setStyle(ButtonStyle.Secondary).setDisabled(p >= totalPages)
+        new ButtonBuilder().setCustomId(`agent_details_${agentId}_${p + 1}`).setLabel('下一位 ▶').setStyle(ButtonStyle.Secondary).setDisabled(p >= totalPages)
     );
 
     return { embed, components: [row] };
@@ -559,10 +559,26 @@ client.once('ready', async () => {
         { name: '迴響鬧鐘', description: '設定鬧鐘提前分鐘', options: [{ name: '分鐘', type: 4, description: '分鐘', required: true }] },
         { name: '優惠設定', description: '設定VIP規則', options: [ { name: '地點', type: 3, description: '地點', required: true, choices: [ { name: '闇黑龍王', value: '闇黑龍王' }, { name: '艾畢奈亞', value: '艾畢奈亞' }, { name: '道館', value: '道館' }, { name: '其他', value: '其他' } ] }, { name: '滿幾次', type: 4, description: '次數', required: true }, { name: '送幾次', type: 4, description: '次數', required: true } ] },
         { 
-            name: '營運設定', description: '自動審核與凍結時段設定 (管理員)',
+            name: '營運設定', description: '自動審核、更新與凍結時段設定 (管理員)',
             options: [
-                { name: '自動審核', type: 1, description: '開啟或關閉自動審核', options: [{ name: '狀態', type: 5, description: '是否開啟自動審核', required: true }] },
-                { name: '新增凍結時段', type: 1, description: '新增無法預約的時間範圍 (24H制)', options: [{ name: '開始時間', type: 3, description: '例如 02:00', required: true }, { name: '結束時間', type: 3, description: '例如 10:00', required: true }] },
+                { 
+                    name: '自動審核', type: 1, description: '開啟或關閉自動審核', 
+                    options: [{ 
+                        name: '狀態', type: 5, description: '是否開啟自動審核', required: true, 
+                        choices: [ { name: '開啟', value: true }, { name: '關閉', value: false } ] 
+                    }] 
+                },
+                { 
+                    name: '自動更新看板', type: 1, description: '每分鐘自動刷新看板時間 (注意資源額度)', 
+                    options: [{ 
+                        name: '狀態', type: 5, description: '是否開啟自動更新', required: true,
+                        choices: [ { name: '開啟', value: true }, { name: '關閉', value: false } ] 
+                    }] 
+                },
+                { 
+                    name: '新增凍結時段', type: 1, description: '新增無法預約的時間範圍 (24H制)', 
+                    options: [{ name: '開始時間', type: 3, description: '例如 02:00', required: true }, { name: '結束時間', type: 3, description: '例如 10:00', required: true }] 
+                },
                 { name: '清空凍結時段', type: 1, description: '清除所有已設定的凍結時段' },
                 { name: '查看目前設定', type: 1, description: '查看自動審核狀態與凍結時段' }
             ]
@@ -597,6 +613,7 @@ client.once('ready', async () => {
             const prices = appSettings['prices'] || {};
             const alarmLeadTime = appSettings['alarm']?.leadTime || 15;
             const vipRules = appSettings['vipRules'] || {};
+            const opMode = appSettings['operationMode'] || {};
             
             for (let data of allReservations) {
                 const timeDiff = data.timestamp - now;
@@ -682,7 +699,11 @@ client.once('ready', async () => {
                     await syncManagementMessages(data.ticketMsgs, payload.embeds[0], payload.components);
                 }
             }
-            // 💡 已移除這裡的 updateBoard(); 防止每分鐘的自動更新吃掉請求配額
+            
+            // 💡 若開啟自動更新看板，則每分鐘執行刷新
+            if (opMode.autoRefreshBoard === true) {
+                updateBoard();
+            }
             
         } catch (error) { console.error(error); }
     }, 60 * 1000); 
@@ -889,13 +910,19 @@ client.on('interactionCreate', async interaction => {
                 if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.editReply({ content: '❌ 權限不足' });
                 const sub = interaction.options.getSubcommand();
                 const docRef = db.collection('settings').doc('operationMode');
-                let opData = appSettings['operationMode'] || { autoApprove: false, frozenSlots: [] };
+                // 確保預設值加上了 autoRefreshBoard
+                let opData = appSettings['operationMode'] || { autoApprove: false, autoRefreshBoard: false, frozenSlots: [] };
 
                 if (sub === '自動審核') {
                     const state = interaction.options.getBoolean('狀態');
                     opData.autoApprove = state;
                     await docRef.set(opData, { merge: true });
                     return interaction.editReply(`✅ 已將「自動審核」狀態設定為：**${state ? '🟢 開啟 (系統自動接單)' : '🔴 關閉 (維持人工審核)'}**`);
+                } else if (sub === '自動更新看板') {
+                    const state = interaction.options.getBoolean('狀態');
+                    opData.autoRefreshBoard = state;
+                    await docRef.set(opData, { merge: true });
+                    return interaction.editReply(`✅ 已將「自動更新看板」狀態設定為：**${state ? '🟢 開啟 (每分鐘自動刷新)' : '🔴 關閉 (全手動刷新，最省資源)'}**`);
                 } else if (sub === '新增凍結時段') {
                     const start = interaction.options.getString('開始時間');
                     const end = interaction.options.getString('結束時間');
@@ -911,7 +938,9 @@ client.on('interactionCreate', async interaction => {
                     await docRef.set(opData, { merge: true });
                     return interaction.editReply(`✅ 已清空所有凍結時段，全時段皆可預約。`);
                 } else if (sub === '查看目前設定') {
-                    let desc = `**自動審核狀態**：${opData.autoApprove ? '🟢 開啟 (系統自動接單)' : '🔴 關閉 (維持人工審核)'}\n\n**目前凍結時段**：\n`;
+                    let desc = `**自動審核狀態**：${opData.autoApprove ? '🟢 開啟 (系統自動接單)' : '🔴 關閉 (維持人工審核)'}\n`;
+                    desc += `**自動更新看板**：${opData.autoRefreshBoard ? '🟢 開啟 (每分鐘自動刷新)' : '🔴 關閉 (手動刷新)'}\n\n`;
+                    desc += `**目前凍結時段**：\n`;
                     if (opData.frozenSlots && opData.frozenSlots.length > 0) {
                         opData.frozenSlots.forEach(s => desc += `> 🛑 \`${s.start}\` ~ \`${s.end}\`\n`);
                     } else {
@@ -1191,6 +1220,7 @@ client.on('interactionCreate', async interaction => {
                 } catch (error) {
                     await interaction.editReply({ content: `✅ 預約成功！系統已自動通過。\n⚠️ **請開啟接收私訊功能！**` });
                 }
+                updateBoard();
             } else {
                 const dmEmbed = new EmbedBuilder().setColor(0xFFA500).setTitle('⏳ 預約等待審核中').setDescription(`您的訂單已送出，等待管理員審核通過後才會加入排班表喔！\n**地點**：${location}\n**時間**：${date} ${time}`);
                 try {
@@ -1245,7 +1275,6 @@ client.on('interactionCreate', async interaction => {
             }
 
             if (action === 'edit') {
-                // 🔴 修正：不再從 Firebase `get()`，改從全域記憶體秒拿，確保不會超時
                 const data = allReservations.find(r => r.id === docId);
                 if (!data) return interaction.reply({ content: '❌ 找不到此訂單。', ephemeral: true });
                 
@@ -1262,7 +1291,7 @@ client.on('interactionCreate', async interaction => {
                     new ActionRowBuilder().addComponents(channelInput),
                     new ActionRowBuilder().addComponents(notesInput)
                 );
-                return interaction.showModal(modal); // 保證 3 秒內完成顯示！
+                return interaction.showModal(modal);
             }
 
             if (action === 'reject') {
@@ -1335,6 +1364,7 @@ client.on('interactionCreate', async interaction => {
                     new ButtonBuilder().setCustomId(`cancel_${docId}`).setLabel('🗑️ 取消預約').setStyle(ButtonStyle.Danger)
                 );
                 await editUserDM(data.discordId, data.userDmMsgId, { embeds: [dmEmbed], components: [btnRow] });
+                updateBoard();
                 return;
             }
 
@@ -1384,6 +1414,8 @@ client.on('interactionCreate', async interaction => {
                         .setDescription(`**地點**：${data.location}\n**時間**：${data.date} ${data.time}\n\n專員為您標記了本次服務為 **免單招待**！🎉\n祝您武運昌隆，期待下次再見！`);
                     await editUserDM(data.discordId, data.userDmMsgId, { embeds: [freeEmbed], components: [] });
                 }
+
+                updateBoard();
                 return;
             }
 
@@ -1407,6 +1439,7 @@ client.on('interactionCreate', async interaction => {
                 }
                 await interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFF0000).setTitle('🚫 訂單已取消').setDescription(`**地點**：${data.location}\n**時間**：${data.date} ${data.time}`)], components: [] });
                 await interaction.followUp({ content: replyText, ephemeral: true });
+                updateBoard();
             }
         }
 
@@ -1484,6 +1517,8 @@ client.on('interactionCreate', async interaction => {
                 new ButtonBuilder().setCustomId(`cancel_${docId}`).setLabel('🗑️ 取消預約').setStyle(ButtonStyle.Danger)
             );
             await interaction.editReply({ embeds: [dmEmbed], components: [btnRow] });
+
+            updateBoard();
         }
 
     } catch (error) {
