@@ -1496,7 +1496,9 @@ client.on('interactionCreate', async interaction => {
     }
 });
 
-client.login(process.env.DISCORD_TOKEN).catch(error => {
-    console.error('❌ [Discord 登入失敗]：');
+client.login(process.env.DISCORD_TOKEN).then(() => {
+    console.log('✅ Discord Token 驗證成功，正在登入...');
+}).catch(error => {
+    console.error('❌ [致命錯誤] Discord 登入失敗，原因如下：');
     console.error(error);
 });
