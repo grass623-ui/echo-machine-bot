@@ -32,12 +32,9 @@ console.log('✅ Firebase 資料庫連線成功！');
 let allReservations = [];
 let appSettings = {};
 
-// 💡 記憶體優化：只拉取並監聽最近 90 天內的訂單，避免長期運行導致記憶體溢出
-const ninetyDaysAgo = Date.now() - 90 * 24 * 60 * 60 * 1000;
-db.collection('reservations').where('timestamp', '>=', ninetyDaysAgo).onSnapshot(snapshot => {
+db.collection('reservations').onSnapshot(snapshot => {
     allReservations = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
 });
-
 db.collection('settings').onSnapshot(snapshot => {
     snapshot.docs.forEach(doc => { appSettings[doc.id] = doc.data(); });
 });
@@ -57,11 +54,9 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBit
 
 const publicBoardIntro = "🎉 **歡迎來到迴響預約中心！**\n為了出團順暢，請提早預約您的專屬迴響時段。\n👇 請點擊下方 **【📝 預約迴響時間】** 快速排單，系統將會為您登記並通知審核！";
 const reserveBtnRow = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('btn_reserve').setLabel('📝 預約迴響時間').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('btn_refresh_board').setLabel('🔄 手動刷新看板').setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId('btn_reserve').setLabel('📝 預約迴響時間').setStyle(ButtonStyle.Primary)
 );
 
-// --- 工具函數 ---
 function getTaiwanTime() {
     const now = new Date();
     const twDate = new Date(now.getTime() + (8 * 60 * 60 * 1000));
@@ -74,22 +69,9 @@ function getTaiwanTime() {
     };
 }
 
-// 💡 時間防呆優化：將單數的月份或日期補零，避免 new Date() 解析為 NaN
-function formatDateTimeStr(dateStr, timeStr) {
-    let parts = dateStr.replace(/\//g, '-').split('-');
-    if (parts.length === 3) {
-        parts[1] = parts[1].padStart(2, '0');
-        parts[2] = parts[2].padStart(2, '0');
-        dateStr = parts.join('-');
-    }
-    if (timeStr.length === 4 && timeStr.indexOf(':') === 1) timeStr = '0' + timeStr;
-    const dt = new Date(`${dateStr}T${timeStr}:00+08:00`);
-    return { formattedDate: dateStr, formattedTime: timeStr, parsedDate: dt };
-}
-
 function getBoardContentWithTime() {
     const tw = getTaiwanTime();
-    return `${publicBoardIntro}\n\n🔄 **最後刷新時間**：\`${tw.yyyy}-${tw.mm}-${tw.dd} ${tw.hh}:${tw.min}\`\n*(💡 若想確認最新排單，請點擊「手動刷新看板」)*`;
+    return `${publicBoardIntro}\n\n🔄 **最後刷新時間**：\`${tw.yyyy}-${tw.mm}-${tw.dd} ${tw.hh}:${tw.min}\``;
 }
 
 function isTimeFrozen(timeStr, frozenSlots) {
@@ -399,6 +381,7 @@ async function updateBoard() {
                 const ch = await client.channels.fetch(b.channelId).catch(() => null);
                 if (ch) {
                     const msg = await ch.messages.fetch(b.messageId).catch(() => null);
+                    const tw = getTaiwanTime();
                     if (msg) {
                         const { embed } = generateScheduleEmbed(reservations, true, 1, false);
                         await msg.edit({ content: null, embeds: [embed] });
@@ -457,13 +440,14 @@ function calculateOrderPrice(order) {
         const orderIndex = userHistory.findIndex(r => r.id === order.id);
         if (orderIndex !== -1) {
             const cycle = rule.buy + rule.free;
-            if ((orderIndex % cycle) >= rule.buy) price = 0; 
+            if ((orderIndex % cycle) >= rule.buy) price = 0; // VIP 免單
         }
     }
     return price;
 }
 
 function buildAgentStatMessage(agentId) {
+    // 找出所有有接單過的人員名單
     const agentIds = [...new Set(allReservations.filter(r => r.takenBy && (r.status === 'completed' || r.status === 'failed' || r.status === 'free')).map(r => r.takenBy))];
     const currentIndex = agentIds.indexOf(agentId);
     
@@ -550,7 +534,7 @@ function buildAgentDetailsMessage(agentId, page) {
     const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`agent_details_${agentId}_${p - 1}`).setLabel('◀ 上一頁').setStyle(ButtonStyle.Secondary).setDisabled(p <= 1),
         new ButtonBuilder().setCustomId(`agent_nav_curr_${agentId}`).setLabel('↩ 返回統計摘要').setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId(`agent_details_${agentId}_${p + 1}`).setLabel('下一位 ▶').setStyle(ButtonStyle.Secondary).setDisabled(p >= totalPages)
+        new ButtonBuilder().setCustomId(`agent_details_${agentId}_${p + 1}`).setLabel('下一頁 ▶').setStyle(ButtonStyle.Secondary).setDisabled(p >= totalPages)
     );
 
     return { embed, components: [row] };
@@ -558,14 +542,11 @@ function buildAgentDetailsMessage(agentId, page) {
 
 client.once('ready', async () => {
     console.log(`[Bot] Logged in as ${client.user.tag}!`);
-    
-    // 💡 修正了營運設定中的 Boolean 型別衝突問題
     const commands = [
         { name: '預約', description: '開啟王團預約表單', options: [{ name: '地點', type: 3, description: '請選擇預約地點', required: true, choices: [ { name: '闇黑龍王', value: '闇黑龍王' }, { name: '艾畢奈亞', value: '艾畢奈亞' }, { name: '道館', value: '道館' }, { name: '其他', value: '其他' } ] }] },
         { name: '我的紀錄', description: '查詢個人的預約統計與排單狀態' },
         { name: '接單統計', description: '查詢各專員的接單績效與收益 (管理員/專員)' },
         { name: '查詢預約', description: '分頁檢視未來的完整預約清單 (管理員)' },
-        { name: '刷新看板', description: '強制手動刷新所有預約看板 (管理員)' },
         { name: '註冊迴響專員', description: '申請註冊成為專屬迴響專員 (需管理員審核)' },
         { name: '指定迴響專員', description: '直接指定玩家成為迴響專員 (管理員)', options: [{ name: '玩家', type: 6, description: '選擇目標玩家', required: true }] },
         { name: '刪除迴響專員', description: '移除玩家的迴響專員身分 (管理員)', options: [{ name: '玩家', type: 6, description: '選擇要移除身分的玩家', required: true }] },
@@ -577,26 +558,10 @@ client.once('ready', async () => {
         { name: '迴響鬧鐘', description: '設定鬧鐘提前分鐘', options: [{ name: '分鐘', type: 4, description: '分鐘', required: true }] },
         { name: '優惠設定', description: '設定VIP規則', options: [ { name: '地點', type: 3, description: '地點', required: true, choices: [ { name: '闇黑龍王', value: '闇黑龍王' }, { name: '艾畢奈亞', value: '艾畢奈亞' }, { name: '道館', value: '道館' }, { name: '其他', value: '其他' } ] }, { name: '滿幾次', type: 4, description: '次數', required: true }, { name: '送幾次', type: 4, description: '次數', required: true } ] },
         { 
-            name: '營運設定', description: '自動審核、更新與凍結時段設定 (管理員)',
+            name: '營運設定', description: '自動審核與凍結時段設定 (管理員)',
             options: [
-                { 
-                    name: '自動審核', type: 1, description: '開啟或關閉自動審核', 
-                    options: [{ 
-                        name: '狀態', type: 3, description: '是否開啟自動審核', required: true, 
-                        choices: [ { name: '開啟', value: 'true' }, { name: '關閉', value: 'false' } ] 
-                    }] 
-                },
-                { 
-                    name: '自動更新看板', type: 1, description: '每分鐘自動刷新看板時間 (注意資源額度)', 
-                    options: [{ 
-                        name: '狀態', type: 3, description: '是否開啟自動更新', required: true,
-                        choices: [ { name: '開啟', value: 'true' }, { name: '關閉', value: 'false' } ] 
-                    }] 
-                },
-                { 
-                    name: '新增凍結時段', type: 1, description: '新增無法預約的時間範圍 (24H制)', 
-                    options: [{ name: '開始時間', type: 3, description: '例如 02:00', required: true }, { name: '結束時間', type: 3, description: '例如 10:00', required: true }] 
-                },
+                { name: '自動審核', type: 1, description: '開啟或關閉自動審核', options: [{ name: '狀態', type: 5, description: '是否開啟自動審核', required: true }] },
+                { name: '新增凍結時段', type: 1, description: '新增無法預約的時間範圍 (24H制)', options: [{ name: '開始時間', type: 3, description: '例如 02:00', required: true }, { name: '結束時間', type: 3, description: '例如 10:00', required: true }] },
                 { name: '清空凍結時段', type: 1, description: '清除所有已設定的凍結時段' },
                 { name: '查看目前設定', type: 1, description: '查看自動審核狀態與凍結時段' }
             ]
@@ -631,7 +596,6 @@ client.once('ready', async () => {
             const prices = appSettings['prices'] || {};
             const alarmLeadTime = appSettings['alarm']?.leadTime || 15;
             const vipRules = appSettings['vipRules'] || {};
-            const opMode = appSettings['operationMode'] || {};
             
             for (let data of allReservations) {
                 const timeDiff = data.timestamp - now;
@@ -717,10 +681,7 @@ client.once('ready', async () => {
                     await syncManagementMessages(data.ticketMsgs, payload.embeds[0], payload.components);
                 }
             }
-            
-            if (opMode.autoRefreshBoard === true) {
-                updateBoard();
-            }
+            updateBoard();
             
         } catch (error) { console.error(error); }
     }, 60 * 1000); 
@@ -728,6 +689,9 @@ client.once('ready', async () => {
 
 client.on('interactionCreate', async interaction => {
     try {
+        // ==========================================
+        // 伺服器白名單檢查
+        // ==========================================
         if (interaction.guildId && ALLOWED_GUILDS.length > 0 && !ALLOWED_GUILDS.includes(interaction.guildId)) {
             if (interaction.isRepliable()) {
                 return interaction.reply({ content: '❌ 此伺服器尚未開通迴響機器人服務。', ephemeral: true }).catch(() => {});
@@ -752,12 +716,7 @@ client.on('interactionCreate', async interaction => {
 
             await interaction.deferReply({ ephemeral: true });
 
-            if (interaction.commandName === '刷新看板') {
-                if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.editReply({ content: '❌ 權限不足' });
-                await updateBoard();
-                return interaction.editReply({ content: '✅ 所有預約看板已手動強制刷新完畢！' });
-            }
-            else if (interaction.commandName === '註冊迴響專員') {
+            if (interaction.commandName === '註冊迴響專員') {
                 const userRef = db.collection('users').doc(interaction.user.id);
                 const userDoc = await userRef.get();
                 let ud = userDoc.exists ? userDoc.data() : { violationPoints: 0, bannedUntil: null };
@@ -829,6 +788,7 @@ client.on('interactionCreate', async interaction => {
                             } catch (e) {}
                         }
                     }
+                    setTimeout(() => { updateBoard(); }, 1500); 
                     return interaction.editReply({ content: `✅ 已成功從資料庫徹底刪除訂單 \`${docId}\`！` });
                 }
 
@@ -924,21 +884,13 @@ client.on('interactionCreate', async interaction => {
                 if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.editReply({ content: '❌ 權限不足' });
                 const sub = interaction.options.getSubcommand();
                 const docRef = db.collection('settings').doc('operationMode');
-                let opData = appSettings['operationMode'] || { autoApprove: false, autoRefreshBoard: false, frozenSlots: [] };
+                let opData = appSettings['operationMode'] || { autoApprove: false, frozenSlots: [] };
 
-                // 💡 修正了從 string 解析 boolean 的邏輯
                 if (sub === '自動審核') {
-                    const stateStr = interaction.options.getString('狀態');
-                    const state = stateStr === 'true';
+                    const state = interaction.options.getBoolean('狀態');
                     opData.autoApprove = state;
                     await docRef.set(opData, { merge: true });
                     return interaction.editReply(`✅ 已將「自動審核」狀態設定為：**${state ? '🟢 開啟 (系統自動接單)' : '🔴 關閉 (維持人工審核)'}**`);
-                } else if (sub === '自動更新看板') {
-                    const stateStr = interaction.options.getString('狀態');
-                    const state = stateStr === 'true';
-                    opData.autoRefreshBoard = state;
-                    await docRef.set(opData, { merge: true });
-                    return interaction.editReply(`✅ 已將「自動更新看板」狀態設定為：**${state ? '🟢 開啟 (每分鐘自動刷新)' : '🔴 關閉 (全手動刷新，最省資源)'}**`);
                 } else if (sub === '新增凍結時段') {
                     const start = interaction.options.getString('開始時間');
                     const end = interaction.options.getString('結束時間');
@@ -954,9 +906,7 @@ client.on('interactionCreate', async interaction => {
                     await docRef.set(opData, { merge: true });
                     return interaction.editReply(`✅ 已清空所有凍結時段，全時段皆可預約。`);
                 } else if (sub === '查看目前設定') {
-                    let desc = `**自動審核狀態**：${opData.autoApprove ? '🟢 開啟 (系統自動接單)' : '🔴 關閉 (維持人工審核)'}\n`;
-                    desc += `**自動更新看板**：${opData.autoRefreshBoard ? '🟢 開啟 (每分鐘自動刷新)' : '🔴 關閉 (手動刷新)'}\n\n`;
-                    desc += `**目前凍結時段**：\n`;
+                    let desc = `**自動審核狀態**：${opData.autoApprove ? '🟢 開啟 (系統自動接單)' : '🔴 關閉 (維持人工審核)'}\n\n**目前凍結時段**：\n`;
                     if (opData.frozenSlots && opData.frozenSlots.length > 0) {
                         opData.frozenSlots.forEach(s => desc += `> 🛑 \`${s.start}\` ~ \`${s.end}\`\n`);
                     } else {
@@ -1064,7 +1014,7 @@ client.on('interactionCreate', async interaction => {
                     }
                 }
                 const statEmbed = new EmbedBuilder().setColor(0x9B59B6).setTitle(`📊 ${interaction.user.username} 的預約數據`)
-                    .addFields({ name: '本月排單', value: `${month} 次`, inline: true }, { name: '近期總單 (90天內)', value: `${total} 次`, inline: true }, { name: '臨時調整', value: `${points} / 3 次`, inline: false }, { name: '帳號狀態', value: banStatus, inline: false });
+                    .addFields({ name: '本月排單', value: `${month} 次`, inline: true }, { name: '歷史總單', value: `${total} 次`, inline: true }, { name: '臨時調整', value: `${points} / 3 次`, inline: false }, { name: '帳號狀態', value: banStatus, inline: false });
                 await interaction.editReply({ embeds: [statEmbed] });
             }
             else if (interaction.commandName === '接單統計') {
@@ -1079,22 +1029,21 @@ client.on('interactionCreate', async interaction => {
             }
         }
 
-        else if (interaction.isButton() && interaction.customId === 'btn_refresh_board') {
-            await interaction.deferUpdate(); 
-            await updateBoard(); 
-        }
-
+        // ==========================================
+        // 專員統計面板 - 按鈕事件處理
+        // ==========================================
         else if (interaction.isButton() && (interaction.customId.startsWith('agent_nav_') || interaction.customId.startsWith('agent_details_'))) {
             await interaction.deferUpdate();
             const parts = interaction.customId.split('_');
             const agentIds = [...new Set(allReservations.filter(r => r.takenBy && (r.status === 'completed' || r.status === 'failed' || r.status === 'free')).map(r => r.takenBy))];
             
+            // 面板導覽：上一位、下一位、返回
             if (interaction.customId.startsWith('agent_nav_')) {
-                const action = parts[2]; 
+                const action = parts[2]; // prev, next, curr
                 const currentAgentId = parts[3];
                 let currIdx = agentIds.indexOf(currentAgentId);
                 
-                if (currIdx === -1) currIdx = 0; 
+                if (currIdx === -1) currIdx = 0; // 防呆
                 
                 if (action === 'prev') currIdx = Math.max(0, currIdx - 1);
                 if (action === 'next') currIdx = Math.min(agentIds.length - 1, currIdx + 1);
@@ -1104,6 +1053,7 @@ client.on('interactionCreate', async interaction => {
                 return interaction.editReply({ embeds: [embed], components });
             }
             
+            // 查看明細 (切換頁數)
             if (interaction.customId.startsWith('agent_details_')) {
                 const agentId = parts[2];
                 const page = parseInt(parts[3]);
@@ -1169,29 +1119,26 @@ client.on('interactionCreate', async interaction => {
                     } catch (e) {}
                 }
             }
+            
+            setTimeout(() => { updateBoard(); }, 1500); 
             return interaction.editReply({ content: `✅ 已成功從資料庫徹底刪除該筆訂單紀錄！`, components: [] });
         }
 
         else if (interaction.isModalSubmit() && interaction.customId.startsWith('reserve_')) {
             await interaction.deferReply({ ephemeral: true });
-            
-            if (interaction.message && interaction.message.flags.has(64)) {
-                await interaction.message.delete().catch(() => {});
-            }
+            if (interaction.message) await interaction.message.delete().catch(() => {});
 
             const location = interaction.customId.split('_')[1];
-            let date = interaction.fields.getTextInputValue('date');
+            const date = interaction.fields.getTextInputValue('date').replace(/\//g, '-');
             let time = interaction.fields.getTextInputValue('time');
             const gameId = interaction.fields.getTextInputValue('gameId');
             const channel = interaction.fields.getTextInputValue('channel') || ''; 
             const notes = interaction.fields.getTextInputValue('notes') || '無';
             
-            const { formattedDate, formattedTime, parsedDate } = formatDateTimeStr(date, time);
-            date = formattedDate;
-            time = formattedTime;
-            const newDateTime = parsedDate;
+            if (time.length === 4 && time.indexOf(':') === 1) time = '0' + time;
+            const newDateTime = new Date(`${date}T${time}:00+08:00`);
 
-            if (isNaN(newDateTime.getTime())) return interaction.editReply({ content: '❌ **日期或時間格式錯誤**，請確認格式（例如：2026-08-18 14:30）。' });
+            if (isNaN(newDateTime.getTime())) return interaction.editReply({ content: '❌ **日期或時間格式錯誤**。' });
             if (newDateTime.getTime() <= Date.now()) return interaction.editReply({ content: '❌ **無法預約過去的時間**。' });
 
             const isConflict = allReservations.some(res => res.location === location && Math.abs(newDateTime.getTime() - res.timestamp) < 10 * 60 * 1000 && res.status === 'approved');
@@ -1233,7 +1180,7 @@ client.on('interactionCreate', async interaction => {
                     await docRef.update({ userDmMsgId: dmMsg.id });
                     await interaction.editReply({ content: `✅ **預約成功！** 系統已自動審核通過，請查看 DM 確認。` });
                 } catch (error) {
-                    await interaction.editReply({ content: `✅ 預約成功！系統已自動通過。\n⚠️ **請開啟「允許伺服器成員傳送私人訊息」功能以接收後續通知！**` });
+                    await interaction.editReply({ content: `✅ 預約成功！系統已自動通過。\n⚠️ **請開啟接收私訊功能！**` });
                 }
                 updateBoard();
             } else {
@@ -1243,7 +1190,7 @@ client.on('interactionCreate', async interaction => {
                     await docRef.update({ userDmMsgId: dmMsg.id });
                     await interaction.editReply({ content: `✅ 預約已送出！請查看 DM 等待審核結果。` });
                 } catch (error) {
-                    await interaction.editReply({ content: `✅ 預約已送出，正在等待審核。\n⚠️ **請開啟「允許伺服器成員傳送私人訊息」功能以接收後續通知！**` });
+                    await interaction.editReply({ content: `✅ 預約已送出，正在等待審核。\n⚠️ **請開啟接收私訊功能！**` });
                 }
             }
         }
@@ -1290,8 +1237,10 @@ client.on('interactionCreate', async interaction => {
             }
 
             if (action === 'edit') {
-                const data = allReservations.find(r => r.id === docId);
-                if (!data) return interaction.reply({ content: '❌ 找不到此訂單。', ephemeral: true });
+                const docRef = db.collection('reservations').doc(docId);
+                const doc = await docRef.get();
+                if (!doc.exists) return interaction.reply({ content: '❌ 找不到此訂單。', ephemeral: true });
+                const data = doc.data();
                 
                 const modal = new ModalBuilder().setCustomId(`submitEdit_${docId}`).setTitle('變更登記資料');
                 const channelInput = new TextInputBuilder().setCustomId('channel').setLabel("幸運頻道").setStyle(TextInputStyle.Short).setRequired(false);
@@ -1468,18 +1417,16 @@ client.on('interactionCreate', async interaction => {
             await interaction.deferUpdate(); 
             
             const docId = interaction.customId.split('_')[1];
-            let newDate = interaction.fields.getTextInputValue('newDate');
+            const newDate = interaction.fields.getTextInputValue('newDate').replace(/\//g, '-');
             let newTime = interaction.fields.getTextInputValue('newTime');
             const newGameId = interaction.fields.getTextInputValue('gameId');
             const newChannel = interaction.fields.getTextInputValue('channel') || '';
             const newNotes = interaction.fields.getTextInputValue('notes') || '無';
             
-            const { formattedDate, formattedTime, parsedDate } = formatDateTimeStr(newDate, newTime);
-            newDate = formattedDate;
-            newTime = formattedTime;
-            const newDateTime = parsedDate;
+            if (newTime.length === 4 && newTime.indexOf(':') === 1) newTime = '0' + newTime;
+            const newDateTime = new Date(`${newDate}T${newTime}:00+08:00`);
 
-            if (isNaN(newDateTime.getTime())) return interaction.followUp({ content: '❌ 格式錯誤，請確認日期格式。', ephemeral: true });
+            if (isNaN(newDateTime.getTime())) return interaction.followUp({ content: '❌ 格式錯誤。', ephemeral: true });
             if (newDateTime.getTime() <= Date.now()) return interaction.followUp({ content: '❌ 無法改為過去的時間。', ephemeral: true });
 
             const opMode = appSettings['operationMode'] || {};
