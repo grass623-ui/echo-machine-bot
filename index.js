@@ -32,9 +32,12 @@ console.log('✅ Firebase 資料庫連線成功！');
 let allReservations = [];
 let appSettings = {};
 
-db.collection('reservations').onSnapshot(snapshot => {
+// 💡 記憶體優化：只拉取並監聽最近 90 天內的訂單，避免長期運行導致記憶體溢出
+const ninetyDaysAgo = Date.now() - 90 * 24 * 60 * 60 * 1000;
+db.collection('reservations').where('timestamp', '>=', ninetyDaysAgo).onSnapshot(snapshot => {
     allReservations = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
 });
+
 db.collection('settings').onSnapshot(snapshot => {
     snapshot.docs.forEach(doc => { appSettings[doc.id] = doc.data(); });
 });
@@ -58,6 +61,7 @@ const reserveBtnRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('btn_refresh_board').setLabel('🔄 手動刷新看板').setStyle(ButtonStyle.Secondary)
 );
 
+// --- 工具函數 ---
 function getTaiwanTime() {
     const now = new Date();
     const twDate = new Date(now.getTime() + (8 * 60 * 60 * 1000));
@@ -68,6 +72,19 @@ function getTaiwanTime() {
         hh: String(twDate.getUTCHours()).padStart(2, '0'),
         min: String(twDate.getUTCMinutes()).padStart(2, '0')
     };
+}
+
+// 💡 時間防呆優化：將單數的月份或日期補零，避免 new Date() 解析為 NaN
+function formatDateTimeStr(dateStr, timeStr) {
+    let parts = dateStr.replace(/\//g, '-').split('-');
+    if (parts.length === 3) {
+        parts[1] = parts[1].padStart(2, '0');
+        parts[2] = parts[2].padStart(2, '0');
+        dateStr = parts.join('-');
+    }
+    if (timeStr.length === 4 && timeStr.indexOf(':') === 1) timeStr = '0' + timeStr;
+    const dt = new Date(`${dateStr}T${timeStr}:00+08:00`);
+    return { formattedDate: dateStr, formattedTime: timeStr, parsedDate: dt };
 }
 
 function getBoardContentWithTime() {
@@ -382,7 +399,6 @@ async function updateBoard() {
                 const ch = await client.channels.fetch(b.channelId).catch(() => null);
                 if (ch) {
                     const msg = await ch.messages.fetch(b.messageId).catch(() => null);
-                    const tw = getTaiwanTime();
                     if (msg) {
                         const { embed } = generateScheduleEmbed(reservations, true, 1, false);
                         await msg.edit({ content: null, embeds: [embed] });
@@ -910,7 +926,6 @@ client.on('interactionCreate', async interaction => {
                 if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return interaction.editReply({ content: '❌ 權限不足' });
                 const sub = interaction.options.getSubcommand();
                 const docRef = db.collection('settings').doc('operationMode');
-                // 確保預設值加上了 autoRefreshBoard
                 let opData = appSettings['operationMode'] || { autoApprove: false, autoRefreshBoard: false, frozenSlots: [] };
 
                 if (sub === '自動審核') {
@@ -1048,7 +1063,7 @@ client.on('interactionCreate', async interaction => {
                     }
                 }
                 const statEmbed = new EmbedBuilder().setColor(0x9B59B6).setTitle(`📊 ${interaction.user.username} 的預約數據`)
-                    .addFields({ name: '本月排單', value: `${month} 次`, inline: true }, { name: '歷史總單', value: `${total} 次`, inline: true }, { name: '臨時調整', value: `${points} / 3 次`, inline: false }, { name: '帳號狀態', value: banStatus, inline: false });
+                    .addFields({ name: '本月排單', value: `${month} 次`, inline: true }, { name: '近期總單 (90天內)', value: `${total} 次`, inline: true }, { name: '臨時調整', value: `${points} / 3 次`, inline: false }, { name: '帳號狀態', value: banStatus, inline: false });
                 await interaction.editReply({ embeds: [statEmbed] });
             }
             else if (interaction.commandName === '接單統計') {
@@ -1164,19 +1179,25 @@ client.on('interactionCreate', async interaction => {
 
         else if (interaction.isModalSubmit() && interaction.customId.startsWith('reserve_')) {
             await interaction.deferReply({ ephemeral: true });
-            if (interaction.message) await interaction.message.delete().catch(() => {});
+            
+            // 💡 防呆：如果觸發這段的是一個暫時的選單訊息，就把它刪掉，不要誤刪公開看板
+            if (interaction.message && interaction.message.flags.has(64)) {
+                await interaction.message.delete().catch(() => {});
+            }
 
             const location = interaction.customId.split('_')[1];
-            const date = interaction.fields.getTextInputValue('date').replace(/\//g, '-');
+            let date = interaction.fields.getTextInputValue('date');
             let time = interaction.fields.getTextInputValue('time');
             const gameId = interaction.fields.getTextInputValue('gameId');
             const channel = interaction.fields.getTextInputValue('channel') || ''; 
             const notes = interaction.fields.getTextInputValue('notes') || '無';
             
-            if (time.length === 4 && time.indexOf(':') === 1) time = '0' + time;
-            const newDateTime = new Date(`${date}T${time}:00+08:00`);
+            const { formattedDate, formattedTime, parsedDate } = formatDateTimeStr(date, time);
+            date = formattedDate;
+            time = formattedTime;
+            const newDateTime = parsedDate;
 
-            if (isNaN(newDateTime.getTime())) return interaction.editReply({ content: '❌ **日期或時間格式錯誤**。' });
+            if (isNaN(newDateTime.getTime())) return interaction.editReply({ content: '❌ **日期或時間格式錯誤**，請確認格式（例如：2026-08-18 14:30）。' });
             if (newDateTime.getTime() <= Date.now()) return interaction.editReply({ content: '❌ **無法預約過去的時間**。' });
 
             const isConflict = allReservations.some(res => res.location === location && Math.abs(newDateTime.getTime() - res.timestamp) < 10 * 60 * 1000 && res.status === 'approved');
@@ -1218,7 +1239,7 @@ client.on('interactionCreate', async interaction => {
                     await docRef.update({ userDmMsgId: dmMsg.id });
                     await interaction.editReply({ content: `✅ **預約成功！** 系統已自動審核通過，請查看 DM 確認。` });
                 } catch (error) {
-                    await interaction.editReply({ content: `✅ 預約成功！系統已自動通過。\n⚠️ **請開啟接收私訊功能！**` });
+                    await interaction.editReply({ content: `✅ 預約成功！系統已自動通過。\n⚠️ **請開啟「允許伺服器成員傳送私人訊息」功能以接收後續通知！**` });
                 }
                 updateBoard();
             } else {
@@ -1228,7 +1249,7 @@ client.on('interactionCreate', async interaction => {
                     await docRef.update({ userDmMsgId: dmMsg.id });
                     await interaction.editReply({ content: `✅ 預約已送出！請查看 DM 等待審核結果。` });
                 } catch (error) {
-                    await interaction.editReply({ content: `✅ 預約已送出，正在等待審核。\n⚠️ **請開啟接收私訊功能！**` });
+                    await interaction.editReply({ content: `✅ 預約已送出，正在等待審核。\n⚠️ **請開啟「允許伺服器成員傳送私人訊息」功能以接收後續通知！**` });
                 }
             }
         }
@@ -1453,16 +1474,18 @@ client.on('interactionCreate', async interaction => {
             await interaction.deferUpdate(); 
             
             const docId = interaction.customId.split('_')[1];
-            const newDate = interaction.fields.getTextInputValue('newDate').replace(/\//g, '-');
+            let newDate = interaction.fields.getTextInputValue('newDate');
             let newTime = interaction.fields.getTextInputValue('newTime');
             const newGameId = interaction.fields.getTextInputValue('gameId');
             const newChannel = interaction.fields.getTextInputValue('channel') || '';
             const newNotes = interaction.fields.getTextInputValue('notes') || '無';
             
-            if (newTime.length === 4 && newTime.indexOf(':') === 1) newTime = '0' + newTime;
-            const newDateTime = new Date(`${newDate}T${newTime}:00+08:00`);
+            const { formattedDate, formattedTime, parsedDate } = formatDateTimeStr(newDate, newTime);
+            newDate = formattedDate;
+            newTime = formattedTime;
+            const newDateTime = parsedDate;
 
-            if (isNaN(newDateTime.getTime())) return interaction.followUp({ content: '❌ 格式錯誤。', ephemeral: true });
+            if (isNaN(newDateTime.getTime())) return interaction.followUp({ content: '❌ 格式錯誤，請確認日期格式。', ephemeral: true });
             if (newDateTime.getTime() <= Date.now()) return interaction.followUp({ content: '❌ 無法改為過去的時間。', ephemeral: true });
 
             const opMode = appSettings['operationMode'] || {};
