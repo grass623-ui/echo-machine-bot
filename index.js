@@ -101,8 +101,7 @@ function formatDateTimeStr(dateStr, timeStr) {
 }
 
 function getBoardContentWithTime() {
-    const tw = getTaiwanTime();
-    return `${publicBoardIntro}\n\n🔄 **最後刷新時間**：\`${tw.yyyy}-${tw.mm}-${tw.dd} ${tw.hh}:${tw.min}\`\n*(💡 若想確認最新排單，請點擊「手動刷新看板」)*`;
+    return publicBoardIntro;
 }
 
 function isTimeFrozen(timeStr, frozenSlots) {
@@ -369,8 +368,11 @@ function generateScheduleEmbed(reservations, isAdmin = false, page = 1, isComman
 
     const embed = new EmbedBuilder()
         .setColor(isAdmin ? 0xFF0000 : 0x0099FF)
-        .setTitle(isAdmin ? (isCommand ? `👑【管理員】王團自動排班表 (第 ${p}/${totalPages} 頁)` : '👑【管理員】王團自動排班表') : '👤 迴響預約清單')
         .setDescription(scheduleText);
+        
+    if (isAdmin) {
+        embed.setTitle(isCommand ? `👑【管理員】王團自動排班表 (第 ${p}/${totalPages} 頁)` : '👑【管理員】王團自動排班表');
+    }
     
     return { embed, totalPages, currentPage: p };
 }
